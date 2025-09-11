@@ -507,11 +507,14 @@ def test_mixed_attn():
 
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
 
-    layer = NeuralAttentionSearchLinear(hidden_size=512, head_dim=128, num_heads=2, num_attn_heads=4).cuda()
+    layer = NeuralAttentionSearchLinear(hidden_size=512, head_dim=128, num_heads=2, num_attn_heads=4,
+                                        ops_for_incomplete_chunks='attn',
+                                        compute_dnats_for_invalid_blocks_linear_att=False,
+                                        compute_dnats_for_invalid_blocks_attn=False
+                                        ).cuda()
     input_data = torch.randn((2, 512, 512)).cuda()
     out = layer(input_data)[0]
-    import pdb
-    pdb.set_trace()
+
     loss = (out**2).sum()
     loss.backward()
     import pdb
@@ -574,6 +577,9 @@ def test_mixed_attn():
         scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size=NATS_block_size,
+        ops_for_incomplete_chunks='attn',
+        compute_dnats_for_invalid_blocks_attn=False,
+        compute_dnats_for_invalid_blocks_linear_att=False
     )
 
     loss = (out ** 2)

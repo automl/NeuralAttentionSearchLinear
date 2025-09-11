@@ -157,10 +157,6 @@ def recompute_w_u_nats_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT'])
-})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -169,6 +165,10 @@ def recompute_w_u_nats_fwd_kernel(
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'HNAtS', 'IS_VARLEN'],
 )
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT'])
+})
 @triton.jit(do_not_specialize=['T'])
 def prepare_wy_repr_bwd_nats_kernel(
         k,
@@ -251,7 +251,7 @@ def prepare_wy_repr_bwd_nats_kernel(
     p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t0,), (BT,), (0,))
     # p_A = tl.make_block_ptr(A + (bos*H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
 
-    p_A = tl.make_block_ptr(A, (T - i_t0, BT), (GNAtS * BT, 1), (0, 0), (BT, BT), (1, 0))
+    p_A = tl.make_block_ptr(A,  (BT, T - i_t0), (1, GNAtS * BT), (0, 0), (BT, BT), (0, 1))
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     b_beta = tl.load(p_beta, boundary_check=(0,))

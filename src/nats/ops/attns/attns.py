@@ -370,6 +370,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
                 b_mp = b_m
 
+
     # this function remove the invalid
     rows_are_valid = b_m != float('-inf')
 
@@ -989,6 +990,9 @@ def parallel_attn_nats_fwd(
         BV = min(64, max(16, triton.next_power_of_2(V)))
         num_warps = 2
     assert NAtS_block_size >= BS
+
+    if BV < V:
+        BV = V
 
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)

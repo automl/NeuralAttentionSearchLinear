@@ -54,6 +54,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             g_cumsum_attn = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
         else:
             g_cumsum_attn = None
+
         # TODO make this a dict? check if it can pass torch compile's check
         OFFSET_ATTN = 0
         OFFSET_GATED_DELTA_NET = 1
@@ -87,6 +88,13 @@ class NAtSMixedAttention(torch.autograd.Function):
             NAtS_Block_Size=nats_block_size,
             offset_op=OFFSET_GATED_DELTA_NET
         )
+        if ops_for_incomplete_chunks != 'gated_delta_net':
+            if torch.is_grad_enabled():
+                keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
+            else:
+                keep_wu_as_kv = False
+        else:
+            keep_wu_as_kv = True
 
         g_gated_delta, o_gated_delta, A_gated_delta, final_state_gated_delta = chunk_gated_delta_rule_nats_fwd(
             q=q_lattn,
@@ -109,6 +117,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             offset_delta=OFFSET_GATED_DELTA_NET,
             compute_incomplete_chunk_scores=ops_for_incomplete_chunks == 'gated_delta_net',
             incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+            keep_wu_as_kv=keep_wu_as_kv,
         )
 
         ctx.save_for_backward(
@@ -131,6 +140,7 @@ class NAtSMixedAttention(torch.autograd.Function):
         ctx.ops_for_incomplete_chunks = ops_for_incomplete_chunks
         ctx.compute_dnats_for_invalid_blocks_linear_att = compute_dnats_for_invalid_blocks_linear_att
         ctx.incomplete_block_start_with_ht = incomplete_block_start_with_ht
+        ctx.keep_wu_as_kv = keep_wu_as_kv
 
         return o_gated_delta + o_attn.view(o_gated_delta.shape), final_state_gated_delta
 
@@ -193,6 +203,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             compute_incomplete_chunk_scores=ctx.ops_for_incomplete_chunks == 'gated_delta_net',
             compute_dnats_for_invalid_blocks=ctx.compute_dnats_for_invalid_blocks_linear_att,
             incomplete_block_start_with_ht=ctx.incomplete_block_start_with_ht,
+            keep_wu_as_kv=ctx.keep_wu_as_kv,
         )
         # TODO if we want a uniform dv, we might need some adjustments here!!!
         #  check how to solve problems for dg for transformer
@@ -234,6 +245,7 @@ def nats_mixed_attn(
         scale_attn = k_attn.shape[-1] ** -0.5
     if scale_lattn is None:
         scale_lattn = k_lattn.shape[-1] ** -0.5
+    incomplete_block_start_with_ht = compute_dnats_for_invalid_blocks_attn and  incomplete_block_start_with_ht
 
     o, gated_delta_ht = NAtSMixedAttention.apply(
         q_attn, k_attn, v_attn, q_lattn, k_lattn, v_lattn,
@@ -310,6 +322,9 @@ def test_mixed_attn():
         scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size=NATS_block_size,
+        ops_for_incomplete_chunks='attn',
+        compute_dnats_for_invalid_blocks_attn=False,
+        compute_dnats_for_invalid_blocks_linear_att=False
     )
 
     loss = (out ** 2)
