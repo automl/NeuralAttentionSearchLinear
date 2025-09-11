@@ -35,8 +35,8 @@ class NAtSMixedAttention(torch.autograd.Function):
                 incomplete_block_start_with_ht: bool = True,
                 use_g_for_attn: bool = True,
                 lattn_use_qk_l2norm_in_kernel: bool = True,
-
                 ):
+
         # TODO this is only for head first is True,
         assert nats_block_size >= CHUNK_SIZE
         TNAtS = nats_block_types.shape[1]

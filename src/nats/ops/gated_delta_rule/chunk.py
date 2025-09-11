@@ -283,6 +283,13 @@ def chunk_gated_delta_rule_nats_bwd(
         dw=dw,
         du=dv,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_nats=cu_seqlens_nats,
+        nats_block_types=nats_block_types,
+        nats_block_indices=nats_block_indices,
+        n_nats_blocks=n_nats_blocks,
+        chunk_indices_delta_nats=chunk_indices_delta_nats,
+        nats_block_size=nats_block_size,
+        offset_delta=offset_delta,
         keep_wu_as_kv=keep_wu_as_kv,
     )
     dk.add_(dk2)

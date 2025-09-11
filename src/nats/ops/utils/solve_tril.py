@@ -320,15 +320,14 @@ def merge_16x16_to_64x64_inverse_kernel(
     DOT_PRECISION: tl.constexpr,
     N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
 ):
+    i_t_, i_gnats = tl.program_id(0), tl.program_id(1)
+    # as we store A to be the multiplication of BT, this should not be a big issue, however, the other sizes might
+    # not work as well...
+
+    """
     #i_t, i_bh = tl.program_id(0), tl.program_id(1)
     #i_b, i_h = i_bh // H, i_bh % H
     i_t_, i_gnats = tl.program_id(0), tl.program_id(1)
-    if N_CHUNK_PER_NAtS_BLOCK > 1:
-        i_t_nats = i_t_ // N_CHUNK_PER_NAtS_BLOCK
-        i_t_nats_offset = i_t_ % N_CHUNK_PER_NAtS_BLOCK
-    else:
-        i_t_nats = i_t_
-        i_t_nats_offset = 0
 
     off_bh_nats = tl.load(chunk_indices_op_nats + i_t_ * 2).to(tl.int32)
     i_t = tl.load(chunk_indices_op_nats + i_t_ * 2 + 1).to(tl.int32)
@@ -336,34 +335,9 @@ def merge_16x16_to_64x64_inverse_kernel(
     i_hnats = off_bh_nats % HNAtS
     # i_t is the offset from the current bos, hence, we can recover bos accordingly
     bos = (i_t_ - i_t) * BT
-    i_h = i_hnats * GNAtS + i_gnats
-
-    #n_nats_blocks += (i_b * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
-
-    #T = tl.load(n_nats_blocks) * NAtS_BLOCK_SIZE
-    #eos = bos + T
-    if IS_VARLEN:
-        #i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        i_n = i_b
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-
-        bos_nats, eos_nats = tl.load(cu_seqlens_nats + i_n).to(tl.int32), tl.load(cu_seqlens_nats + i_n + 1).to(
-            tl.int32)
-        TNAtS = eos_nats - bos_nats
-    else:
-        bos, eos = i_b * T, i_b * T + T
-        bos_nats, eos_nats = i_b * TNAtS, i_b * TNAtS + TNAtS
-
-    nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
-    stride_block_types_t = N_TYPES * HNAtS
-
-    load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
-    b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t)
-    o_t0 = b_o_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
-    # there is a shift between o_t0 and i_t * BT since we might skip some chunks in between, so now need to recover them
-    T = T - o_t0 + i_t * BT
-
+    n_nats_blocks += (i_b * HNAtS + i_hnats) * N_TYPES + i_hnats
+    T = tl.load(n_nats_blocks) * NAtS_BLOCK_SIZE
+    """
     """
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -376,8 +350,12 @@ def merge_16x16_to_64x64_inverse_kernel(
     o_i = tl.arange(0, 16)
     m_A = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
-    A += (bos*GNAtS + i_gnats) * BT
-    Ai += (bos*GNAtS + i_gnats) * BT
+    #A += (bos*GNAtS + i_gnats).to(tl.int64) * BT
+    #Ai += (bos*GNAtS + i_gnats).to(tl.int64) * BT
+    A += (i_t_ * BT * GNAtS + i_gnats) * BT
+    Ai += (i_t_ * BT * GNAtS + i_gnats) * BT
+    i_t = 0
+    T = BT
 
     if not USE_TMA:
         p_A_11 = tl.make_block_ptr(A, (T, BT), (GNAtS*BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
@@ -529,7 +507,7 @@ def solve_tril_nats(
         n_nats_blocks (torch.Tensor):
             [B, HNAtS, N_Types], number of NAtS blocks for each nats heads
         nats_block_indices (torch.Tensor):
-            [B, HNAtS, T_NAtS, N_Types], indices of each nats block.
+            [B, T_NAtS, HNAtS, N_Types], indices of each nats block.
         nats_block_size (int):
             nats block size, how many tokens are applied to form a nas block
         cu_seqlens (torch.Tensor):
@@ -577,6 +555,7 @@ def solve_tril_nats(
         n_nats_blocks=n_nats_blocks,
         nats_block_indices=nats_block_indices,
         T=T,
+        TNAtS=nats_block_indices.shape[1],
         H=None,
         HNAtS=n_nats_blocks.shape[1],
         GNAtS =GNAtS,

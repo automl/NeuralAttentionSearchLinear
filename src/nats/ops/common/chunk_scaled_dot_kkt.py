@@ -87,7 +87,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     beta += bos * H + i_h
     k += (bos * H + i_h) * K
 
-    A += i_t_.to(tl.int64) * BT * GNAtS * BT + i_gnats * BT
+    A += (i_t_ * BT * GNAtS + i_gnats).to(tl.int64) * BT
 
     nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
 
@@ -99,13 +99,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t)
     i_t0 = b_o_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
-    p_beta = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t0,), (BT,), (0,))
+    p_beta = tl.make_block_ptr(beta, (T,), (H,), (i_t0,), (BT,), (0,))
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        k_offsets = i_k * BK + tl.arange(0, BK)
-        p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t0, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k, (T, K), (stride_kt, 1), (i_t0, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_A += tl.dot(b_k, tl.trans(b_k))
 
@@ -123,7 +122,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
 
     b_A = tl.where(m_A, b_A, 0)
-    p_A = tl.make_block_ptr(A, (T - i_t0, BT), (BT*H, 1), (0, 0), (BT, BT), (1, 0))
+    p_A = tl.make_block_ptr(A, (T - i_t0, BT), (stride_At, 1), (0, 0), (BT, BT), (1, 0))
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -349,6 +348,7 @@ def chunk_scaled_dot_kkt_nats_fwd(
         #NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
         #A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
         grid = (len(chunk_indices_op_nats), GNAtS)
+
         chunk_scaled_dot_kkt_fwd_kernel[grid](
             k=k,
             g=g,

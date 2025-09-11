@@ -667,17 +667,22 @@ def chunk_bwd_kernel_dkwg(
     if WV_ARE_FLATTENED:
         # TODO here v,g,dw might require a different offsets!!!
         v += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * V
+        stride_vt = V * GNAtS
+
         if USE_DW:
+            stride_wt = K * GNAtS
             w += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * K
             dw += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * K
-            # dv += (bos * H + i_h) * V
             dv += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * V
     else:
         v += (bos * H + i_h) * V
+        stride_vt = V * H
         if USE_DW:
+            stride_wt = K * H
             w += (bos * H + i_h) * K
             dw += (bos * H + i_h) * K
             dv += (bos * H + i_h) * V
+
     if USE_G:
         dg += i_k * ng * H
         b_dg_last = tl.zeros([1, ], dtype=tl.float32) if USE_G else None
@@ -691,18 +696,17 @@ def chunk_bwd_kernel_dkwg(
 
     stride_nats_msk = N_TYPES * H
     stride_kt = K * H
-    stride_vt = V * GNAtS
     stride_nats_block = N_TYPES * HNAtS
 
     load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
     chunk_is_delta = tl.load(nats_block_types + load_idx_chunk * stride_nats_block).to(tl.int1)
 
     if WV_ARE_FLATTENED:
-        b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block).to(tl.int32)
+        b_o_nats_block = tl.load(nats_block_indices + i_th * stride_nats_block).to(tl.int32)
         i_t_nats_offset = i_t % N_CHUNK_PER_NAtS_BLOCK
         i_t0 = b_o_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
-        wv_load_shape0 = T - i_t0
+        wv_load_shape0 = T - i_t0 + i_t * BT
         wv_load_offset = i_th * BT
     else:
         wv_load_shape0 = T
@@ -716,7 +720,7 @@ def chunk_bwd_kernel_dkwg(
 
     if chunk_is_delta:
         for i_v in range(tl.cdiv(V, BV)):
-            p_v = tl.make_block_ptr(v, (wv_load_shape0, V), (H * V, 1), (wv_load_offset, i_v * BV), (BT, BV), (1, 0))
+            p_v = tl.make_block_ptr(v, (wv_load_shape0, V), (stride_vt, 1), (wv_load_offset, i_v * BV), (BT, BV), (1, 0))
             p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
             p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
@@ -726,6 +730,7 @@ def chunk_bwd_kernel_dkwg(
             # [BV, BK]
             b_h = tl.load(p_h, boundary_check=(0, 1))
             b_dh = tl.load(p_dh, boundary_check=(0, 1))
+
             if USE_G:
                 b_dg_last += (tl.sum(b_h * b_dh))
             # [BT, BV] @ [BV, BT] -> [BT, BT]
@@ -736,11 +741,13 @@ def chunk_bwd_kernel_dkwg(
             # [BT, BV] @ [BV, BK] -> [BT, BK]
             b_dk += tl.dot(b_v, b_dh.to(b_v.dtype))
             if USE_DW:
-                p_dv = tl.make_block_ptr(dv, (wv_load_shape0, V), (H * V, 1), (wv_load_offset, i_v * BV), (BT, BV), (1, 0))
+
+                p_dv = tl.make_block_ptr(dv, (wv_load_shape0, V), (stride_vt, 1), (wv_load_offset, i_v * BV), (BT, BV), (1, 0))
                 b_dv = tl.load(p_dv, boundary_check=(0, 1))
                 b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
         if USE_DW:
-            p_dw = tl.make_block_ptr(dw, (wv_load_shape0, K), (H * K, 1), (wv_load_offset, i_k * BK), (BT, BK), (1, 0))
+
+            p_dw = tl.make_block_ptr(dw, (wv_load_shape0, K), (stride_wt, 1), (wv_load_offset, i_k * BK), (BT, BK), (1, 0))
             tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
 
         tl.debug_barrier()
@@ -771,7 +778,7 @@ def chunk_bwd_kernel_dkwg(
             if COMPUTE_INCOMPLETE_BLOCK_SCORES or COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
                 # We only need to load vk if: we need to compute the incomplete block scores or
                 # compute dnats for incomplete scores, otherwise, they will be considered as 0!
-                p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                p_v = tl.make_block_ptr(v, (T, V), (stride_vt, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                 b_v = tl.load(p_v, boundary_check=(0, 1))
                 b_ds += tl.dot(b_do, tl.trans(b_v))
                 if COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
@@ -783,6 +790,9 @@ def chunk_bwd_kernel_dkwg(
                     p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                     b_dv = tl.load(p_dv, boundary_check=(0, 1))
                     b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
+        if USE_DW and COMPUTE_INCOMPLETE_BLOCK_SCORES:
+            p_dw = tl.make_block_ptr(dw, (wv_load_shape0, K), (stride_wt, 1), (wv_load_offset, i_k * BK), (BT, BK), (1, 0))
+            tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
 
         tl.debug_barrier()
         p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))

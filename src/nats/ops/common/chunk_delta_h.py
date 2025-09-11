@@ -420,8 +420,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 
     n_iters = end_nats_wvh_t - start_nats_wvh_t
     if WV_ARE_FLATTENED:
-        w += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * K
-        dv2 += ((start_nats_wvh_t * BT).to(tl.int64) * GNAtS + i_gnats) * V
+        w += (start_nats_wvh_t * BT * GNAtS + i_gnats).to(tl.int64) * K
+        dv2 += (start_nats_wvh_t * BT * GNAtS + i_gnats).to(tl.int64) * V
         stride_v = GNAtS * V
         stride_w = GNAtS * K
     else:
@@ -429,10 +429,10 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         dv2 += (bos * H + i_h) * V
         stride_v = H * V
         stride_w = H * K
+
     if USE_G:
         stride_g = H
         g += bos * H + i_h
-
 
     qdo += (start_nats_wvh_t.to(tl.int64) * GNAtS + i_gnats) * K * V
     dh += (start_nats_wvh_t.to(tl.int64) * GNAtS + i_gnats) * K * V
@@ -464,6 +464,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 
     stride_h = GNAtS * K * V
     stride_k = H * K
+    stride_do = H * V
     stride_nats_block = N_TYPES * HNAtS
 
     if USE_INITIAL_STATE:
@@ -563,7 +564,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         # Update dh
         p_w = tl.make_block_ptr(w, (K, wv_load_shape0), (1, stride_w), (0,  wv_load_offset), (64, BT), (0, 1))
         p_qdo = tl.make_block_ptr(qdo + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        p_do = tl.make_block_ptr(do, (T, V), (stride_v, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
+        p_do = tl.make_block_ptr(do, (T, V), (stride_do, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
 
         b_qdo = tl.load(p_qdo, boundary_check=(0, 1))
         b_w = tl.load(p_w, boundary_check=(0, 1))
