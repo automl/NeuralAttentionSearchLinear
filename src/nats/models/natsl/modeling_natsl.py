@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import numpy as np
 import math
 import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
@@ -35,6 +37,16 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class NAtSCausalLMOutputWithPast(CausalLMOutputWithPast):
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    attn_frac: Optional[float] = None
 
 
 class NeuralAttentionSearchLinearBlock(nn.Module):
@@ -442,15 +454,18 @@ class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrain
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
+        all_attn_fraction = np.mean([layer.attn.attn_fraction for layer in self.model.layers]).item()
+
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return NAtSCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            attn_frac=all_attn_fraction,
         )
