@@ -883,7 +883,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
             # [BT, BS] @ [BS, BK] -> [BT, BK]
             b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
 
-            b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0) / BT)
+            b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
 
             if USE_G:
                 b_dg -= tl.sum(b_ds, 1)
@@ -922,7 +922,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
             # [BT, BS] @ [BS, BK] -> [BT, BK]
             b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
 
-            b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0) / BT)
+            b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
 
             if USE_G:
                 b_dg -= tl.sum(b_ds, 1)
