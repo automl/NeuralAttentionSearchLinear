@@ -344,7 +344,7 @@ class NeuralAttentionSearchLinear(nn.Module):
         # The last block is set 1 for all the operations. This does not influence the output values
         nats_op_types[:,-1] = 1
         n_nats_blocks = nats_op_types.int().sum(1)
-        self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).cpu().detach()
+        self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
 
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None

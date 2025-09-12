@@ -46,7 +46,7 @@ class NAtSCausalLMOutputWithPast(CausalLMOutputWithPast):
     past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-    attn_frac: Optional[float] = None
+    attn_frac: Optional[torch.Tensor] = None
 
 
 class NeuralAttentionSearchLinearBlock(nn.Module):
@@ -454,8 +454,7 @@ class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrain
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-        all_attn_fraction = np.mean([layer.attn.attn_fraction for layer in self.model.layers]).item()
-
+        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers]))
 
         if not return_dict:
             output = (logits,) + outputs[1:]
