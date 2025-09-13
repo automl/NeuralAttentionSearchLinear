@@ -161,6 +161,7 @@ class NAtSMixedAttention(torch.autograd.Function):
         ctx.OFFSET_GATED_DELTA = OFFSET_GATED_DELTA_NET
 
         ctx.ops_for_incomplete_chunks = ops_for_incomplete_chunks
+        ctx.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
         ctx.compute_dnats_for_invalid_blocks_linear_att = compute_dnats_for_invalid_blocks_linear_att
         ctx.incomplete_block_start_with_ht = incomplete_block_start_with_ht
         ctx.keep_wu_as_kv = keep_wu_as_kv
@@ -196,6 +197,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             scale=ctx.scale_attn,
             NAtS_block_size=ctx.nats_block_size,
             OFFSET_ATTN=ctx.OFFSET_ATTN,
+            compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
             compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn,
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,

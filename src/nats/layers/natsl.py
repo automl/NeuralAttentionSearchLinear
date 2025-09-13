@@ -132,8 +132,8 @@ class NeuralAttentionSearchLinear(nn.Module):
             conv_activation: str | None = 'silu',  # TODO check if None or silu works better?
             attn_qk_norm: bool = False,
             attn_with_short_conv: bool = False,
-            compute_dnats_for_invalid_blocks_attn: bool=False,
-            compute_dnats_for_invalid_blocks_linear_att: bool = True,
+            compute_dnats_for_invalid_blocks_attn: bool= False,
+            compute_dnats_for_invalid_blocks_linear_att: bool = False,
             incomplete_block_start_with_ht: bool = True,
             attn_apply_pos_encoding: bool = True,
             attn_rope_theta: Optional[float] = 10000.,

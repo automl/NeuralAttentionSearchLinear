@@ -416,7 +416,7 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                                      nats_block_types, nats_block_indices,  # Both are of shape [B, T, HKV]
                                      n_iters_per_block,
                                      cu_seqlens, chunk_indices, cu_seqlens_nats,
-                                     dk, dv, dnats_block_types,  # used to store the in complete chunk scores
+                                     dk, dv, dnats,  # used to store the in complete chunk scores
                                      scale,
                                      T: tl.constexpr,
                                      TNAtS: tl.constexpr,
@@ -688,7 +688,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                                   do, dg_cumsum,
                                   nats_block_types, nats_block_indices,  # Both are of shape [B, T, HAttns]
                                   chunk_indices_attn_nats, cu_seqlens, chunk_indices, cu_seqlens_nats,
-                                  dk, dv, dnats_block_types,  # used to store the in complete chunk scores
+                                  dk, dv, dnats,  # used to store the in complete chunk scores
                                   scale,
                                   T: tl.constexpr,
                                   TNAtS: tl.constexpr,
@@ -753,7 +753,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
     # TODO This is not the case for nats_block_types, as its TNAtS is typically smaller than the normal T
     # Our current solution is to consider H as 1, i.e., we need to transpose the input data to [B * H, T, 1, D]
     nats_block_types += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_ATTN
-    dnats_block_types += (bos_nats * N_CHUNK_PER_NAtS_BLOCK * HQ + i_h)
+    dnats += (bos_nats * N_CHUNK_PER_NAtS_BLOCK * HQ + i_hq)
     nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_ATTN
 
     stride_kt = K * HKV
@@ -939,13 +939,372 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
     # TODO currently we only consider the gradients where the blocks are selected as attns.
     #  We could also in principle compute
     tl.store(
-        dnats_block_types + (b_i_nats_block * N_CHUNK_PER_NAtS_BLOCK + i_t_nats_offset) * stride_dblock_attn_t,
-        b_dattn.to(dnats_block_types.dtype.element_ty)
+        dnats + (b_i_nats_block * N_CHUNK_PER_NAtS_BLOCK + i_t_nats_offset) * stride_dblock_attn_t,
+        b_dattn.to(dnats.dtype.element_ty)
     )
 
     if USE_G:
         p_dg = tl.make_block_ptr(dg_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
+
+
+
+@triton.heuristics({
+    'USE_G': lambda args: args['g_cumsum'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT'])
+})
+@triton.jit
+def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of shape [B, T, H, DQ]
+                                  g_cumsum, lse, delta,
+                                  do, dg_cumsum,
+                                  nats_block_types, nats_block_indices,  # Both are of shape [B, T, HAttns]
+                                  cu_seqlens, cu_seqlens_nats,
+                                  dk, dv, dnats,  # used to store the in complete chunk scores
+                                  scale,
+                                  T: tl.constexpr,
+                                  TNAtS: tl.constexpr,
+                                  B: tl.constexpr,
+                                  HQ: tl.constexpr,
+                                  HKV: tl.constexpr,
+                                  G: tl.constexpr,
+                                  HNAtS: tl.constexpr,
+                                  GNAtS: tl.constexpr,
+                                  K: tl.constexpr,
+                                  V: tl.constexpr,
+                                  BK: tl.constexpr,
+                                  BV: tl.constexpr,
+                                  BT: tl.constexpr,
+                                  BS: tl.constexpr,
+                                  NAtS_BLOCK_SIZE: tl.constexpr,
+                                  N_TYPES: tl.constexpr,
+                                  OFFSET_ATTN: tl.constexpr,
+                                  COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
+                                  STAGE: tl.constexpr,
+                                  USE_G: tl.constexpr,
+                                  IS_VARLEN: tl.constexpr,
+                                  N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
+                                  ):
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    #i_v, i_t_, i_gnats = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_hq = i_bh // HQ, i_bh % HQ
+
+    if N_CHUNK_PER_NAtS_BLOCK > 1:
+        i_t_nats = i_t // N_CHUNK_PER_NAtS_BLOCK
+        i_t_nats_offset = i_t % N_CHUNK_PER_NAtS_BLOCK
+    else:
+        i_t_nats = i_t
+        i_t_nats_offset = 0
+
+    i_hnats = i_hq // GNAtS
+    i_gnats = i_hq % GNAtS
+    i_h = i_hq // G
+
+    if IS_VARLEN:
+        # i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n = i_b
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+
+        bos_nats, eos_nats = tl.load(cu_seqlens_nats + i_n).to(tl.int32), tl.load(cu_seqlens_nats + i_n + 1).to(
+            tl.int32)
+        TNAtS = eos_nats - bos_nats
+    else:
+        # i_n = off_b
+        bos, eos = i_b * T, i_b * T + T
+        bos_nats, eos_nats = i_b * TNAtS, i_b * TNAtS + TNAtS
+
+    q += (bos * HQ + i_hq) * K
+    lse += bos * HQ + i_hq
+
+    do += (bos * HQ + i_hq) * V
+    delta += bos * HQ + i_hq
+
+    # TODO This is not the case for nats_block_types, as its TNAtS is typically smaller than the normal T
+    # Our current solution is to consider H as 1, i.e., we need to transpose the input data to [B * H, T, 1, D]
+    dnats += (bos_nats * N_CHUNK_PER_NAtS_BLOCK * HQ + i_hq)
+    nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_ATTN
+    nats_block_types += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_ATTN
+
+    stride_kt = K * HKV
+    stride_vt = V * HKV
+
+    stride_dkt = K * HQ
+    stride_dvt = V * HQ
+    # TODO Check if we really need different types for different heads
+    stride_block_types_t = N_TYPES * HNAtS
+    stride_dblock_attn_t = HQ
+    stride_qt = K * HQ
+    stride_ot = V * HQ
+    stride_lset = HQ
+
+
+    #load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
+    #b_i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
+    #i_t0 = b_i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
+    i_t0 = i_t * BT
+
+    # we only check the nats_chunks that are valid
+
+    qk_scale = scale * 1.44269504  # 1/log(2)
+
+    # If it is Stage 1, for values greater than hi, they are involved in STAGE 2
+
+    p_k = tl.make_block_ptr(k + (bos * HKV + i_h) * K, (T, K), (HKV * K, 1), (i_t0, 0), (BT, BK), (1, 0))
+    p_v = tl.make_block_ptr(v + (bos * HKV + i_h) * V, (T, V), (HKV * V, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
+
+    # [BT, BK]
+    b_k = tl.load(p_k, boundary_check=(0, 1))
+    # [BT, BV]
+    b_v = tl.load(p_v, boundary_check=(0, 1))
+
+    o_k = i_t0 + tl.arange(0, BT)
+    m_k = o_k < T
+
+    b_dattn = 0.
+
+    if USE_G:
+        p_gk = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t0,), (BT,), (0,))
+        b_gk = tl.load(p_gk, boundary_check=(0,)).to(tl.float32)
+        b_dg = tl.zeros([BT, ], dtype=tl.float32)
+    else:
+        b_gk = None
+        b_dg = None
+
+    load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
+    chunk_is_delta = tl.load(nats_block_types + load_idx_chunk * stride_block_types_t).to(tl.int1)
+    if chunk_is_delta:
+        p_dk = tl.make_block_ptr(dk + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t0, 0), (BT, BK), (1, 0))
+        p_dv = tl.make_block_ptr(dv + (bos * HQ + i_hq) * V, (T, V), (HQ * V, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
+
+        b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dv = tl.zeros([BT, BV], dtype=tl.float32)
+
+        if STAGE & 2 and COMPUTE_INCOMPLETE_CHUNK_SCORES:
+            lo, hi = i_t0, min(i_t0 + BT, T)
+
+            for i_s in range(lo, hi, BS):
+                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                # [BS]
+                o_q = i_s + tl.arange(0, BS)
+                m_q = o_q < T
+                # [BS, BK]
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                # [BS, BV]
+                b_do = tl.load(p_do, boundary_check=(0, 1))
+                # [BS]
+                b_lse = tl.load(p_lse, boundary_check=(0,))
+                b_delta = tl.load(p_delta, boundary_check=(0,))
+                # [BT, BS]
+                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                if USE_G:
+                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                    b_s += b_gq[None, :] - b_gk[:, None]
+                b_p = tl.where((o_k[:, None] <= o_q[None, :]) & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                # [BT, BS] @ [BS, BV] -> [BT, BV]
+                b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+                # [BT, BV] @ [BV, BS] -> [BT, BS]
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                # [BT, BS]
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                # [BT, BS] @ [BS, BK] -> [BT, BK]
+                b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+                if USE_G:
+                    b_dg -= tl.sum(b_ds, 1)
+
+        if STAGE & 1:
+            if STAGE == 3:
+                if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+                    lo = i_t0 + BT
+                else:
+                    lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
+            else:
+                lo = 0
+            n_iters = (T - lo) // BS
+            for i_s_ in range(n_iters):
+                i_s = lo + i_s_ * BS
+                i_s = tl.multiple_of(i_s, BS)
+                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                # [BS]
+                o_q = i_s + tl.arange(0, BS)
+                m_q = o_q < T
+                # [BS, BK]
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                # [BS, BV]
+                b_do = tl.load(p_do, boundary_check=(0, 1))
+                # [BS]
+                b_lse = tl.load(p_lse, boundary_check=(0,))
+                b_delta = tl.load(p_delta, boundary_check=(0,))
+                # [BT, BS]
+                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                if USE_G:
+                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                    b_s += b_gq[None, :] - b_gk[:, None]
+                b_p = exp2(b_s - b_lse[None, :])
+                # [BT, BS] @ [BS, BV] -> [BT, BV]
+                b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+                # [BT, BV] @ [BV, BS] -> [BT, BS]
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                # [BT, BS]
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                # [BT, BS] @ [BS, BK] -> [BT, BK]
+                b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+
+                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+
+                if USE_G:
+                    b_dg -= tl.sum(b_ds, 1)
+            hi = tl.cdiv(T - lo, BS) * BS + lo
+            if hi > T:
+                i_s = hi - BS
+                # the last block with q partially involved
+                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                # [BS]
+                o_q = i_s + tl.arange(0, BS)
+                m_q = o_q < T
+                # [BS, BK]
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                # [BS, BV]
+                b_do = tl.load(p_do, boundary_check=(0, 1))
+                # [BS]
+                b_lse = tl.load(p_lse, boundary_check=(0,))
+                b_delta = tl.load(p_delta, boundary_check=(0,))
+                # [BT, BS]
+                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                if USE_G:
+                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                    b_s += b_gq[None, :] - b_gk[:, None]
+                b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                # [BT, BS] @ [BS, BV] -> [BT, BV]
+                b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+                # [BT, BV] @ [BV, BS] -> [BT, BS]
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                # [BT, BS]
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                # [BT, BS] @ [BS, BK] -> [BT, BK]
+                b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+
+                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+
+                if USE_G:
+                    b_dg -= tl.sum(b_ds, 1)
+
+        b_dk = b_dk * scale
+        # we also need to read valuesfrom dk dv
+        #if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+        #    b_dk += tl.load(p_dk, boundary_check=(0,1))
+        #    b_dv += tl.load(p_dv, boundary_check=(0,1))
+
+
+        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+        # TODO currently we only consider the gradients where the blocks are selected as attns.
+        #  We could also in principle compute
+        tl.store(
+            dnats + i_t * stride_dblock_attn_t,
+            b_dattn.to(dnats.dtype.element_ty)
+        )
+
+        if USE_G:
+            p_dg = tl.make_block_ptr(dg_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
+            tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
+    else:
+        # THis is the case where we only compute d_nats. This might be too expensive, we need to check if we could
+        # approximate this gradient information...
+        if STAGE & 1:
+            if STAGE == 3:
+                lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
+            else:
+                lo = 0
+            n_iters = (T - lo) // BS
+            for i_s_ in range(n_iters):
+                i_s = lo + i_s_ * BS
+                i_s = tl.multiple_of(i_s, BS)
+                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                # [BS]
+                o_q = i_s + tl.arange(0, BS)
+                # [BS, BK]
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                # [BS, BV]
+                b_do = tl.load(p_do, boundary_check=(0, 1))
+                # [BS]
+                b_lse = tl.load(p_lse, boundary_check=(0,))
+                b_delta = tl.load(p_delta, boundary_check=(0,))
+                # [BT, BS]
+                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                if USE_G:
+                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                    b_s += b_gq[None, :] - b_gk[:, None]
+                b_p = exp2(b_s - b_lse[None, :])
+                b_p = tl.clamp(b_p, 0., 1.)
+                # [BT, BS] @ [BS, BV] -> [BT, BV]
+                # [BT, BV] @ [BV, BS] -> [BT, BS]
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                # [BT, BS]
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                # [BT, BS] @ [BS, BK] -> [BT, BK]
+                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+            hi = tl.cdiv(T - lo, BS) * BS + lo
+            if hi > T:
+                i_s = hi - BS
+                # the last block with q partially involved
+                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                # [BS]
+                o_q = i_s + tl.arange(0, BS)
+                m_q = o_q < T
+                # [BS, BK]
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                # [BS, BV]
+                b_do = tl.load(p_do, boundary_check=(0, 1))
+                # [BS]
+                b_lse = tl.load(p_lse, boundary_check=(0,))
+                b_delta = tl.load(p_delta, boundary_check=(0,))
+                # [BT, BS]
+                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                if USE_G:
+                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                    b_s += b_gq[None, :] - b_gk[:, None]
+                b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                b_p = tl.clamp(b_p, 0., 1.)
+                # [BT, BS] @ [BS, BV] -> [BT, BV]
+                # [BT, BV] @ [BV, BS] -> [BT, BS]
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                # [BT, BS]
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                # [BT, BS] @ [BS, BK] -> [BT, BK]
+                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+
+        # TODO currently we only consider the gradients where the blocks are selected as attns.
+        #  We could also in principle compute
+        tl.store(
+            dnats + i_t * stride_dblock_attn_t,
+            b_dattn.to(dnats.dtype.element_ty)
+        )
 
 
 def parallel_attn_nats_fwd(
@@ -1021,6 +1380,7 @@ def parallel_attn_nats_fwd(
         msk = torch.zeros(B, HQ, T, T, dtype=torch.float32, device=q.device)
     else:
         msk = None
+
     parallel_nats_attn_fwd_kernel[grid](
         q=q, k=k, v=v, o=o, msk=msk,
         g_cumsum=g_cumsum, lse=lse,
@@ -1048,7 +1408,7 @@ def parallel_attn_nats_fwd(
         STORE_MSK=store_msk,
         num_warps=num_warps,
     )
-    # """
+
     return o, lse, msk
 
 
@@ -1083,6 +1443,7 @@ def parallel_attn_nats_bwd(
         NAtS_block_size: int = 64,
         OFFSET_ATTN: int = 0,
         compute_incomplete_chunk_scores: bool = False,
+        compute_dnats_for_invalid_blocks_attn: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_nats: torch.LongTensor | None = None,
         is_causal=True
@@ -1126,7 +1487,7 @@ def parallel_attn_nats_bwd(
     dv = torch.zeros(B, T, HQ, V, dtype=v.dtype if H == HQ else torch.float, device=q.device)
     # since we only compute the partial gradients for those selected as attentions, we will not write to all
     # d_nats_block_types. Hence, this needs to be initialized with 0
-    dnats_block_types = torch.zeros(B, TNAtS * (triton.cdiv(NAtS_block_size, BT)), HQ,
+    dnats = torch.zeros(B, TNAtS * (triton.cdiv(NAtS_block_size, BT)), HQ,
                                     dtype=k.dtype if HNAtS == H else torch.float,
                                     device=q.device)
     grid = (NV, NT, B * HQ)
@@ -1141,7 +1502,7 @@ def parallel_attn_nats_bwd(
         nats_block_indices,
         T, BT, BS, NAtS_block_size, OFFSET_ATTN
     )
-
+    """
     parallel_nats_attn_bwd_kernel_dq[grid](q=q, k=k, v=v,
                                            g_cumsum=g_cumsum, lse=lse, delta=delta,
                                            do=do, dq=dq, dg_cumsum=dg_cumsum,
@@ -1150,7 +1511,7 @@ def parallel_attn_nats_bwd(
                                            n_iters_per_block=n_iters_per_block,
                                            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
                                            cu_seqlens_nats=cu_seqlens_nats,
-                                           dk=dk, dv=dv, dnats_block_types=dnats_block_types,
+                                           dk=dk, dv=dv, dnats=dnats,
                                            scale=scale,
                                            T=T, TNAtS=TNAtS, B=B, HQ=HQ, HKV=H, G=G,
                                            HNAtS=HNAtS,
@@ -1168,56 +1529,85 @@ def parallel_attn_nats_bwd(
                                            OFFSET_ATTN=OFFSET_ATTN,
                                            num_warps=num_warps,
                                            )
+    """
 
     # n_grids =prepare_nats_block_indices
 
     BS = triton.cdiv(BT, NAtS_block_size) * BS  # TODO check if this is really beneficial!!!
     BT = min(BT, NAtS_block_size)  # we need to ensure that each BT block only loads one BT
 
-    chunk_indices_attn_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_ATTN], NAtS_block_size, BT)
-    grid_kv = (NV, len(chunk_indices_attn_nats), GNAtS)
+    if compute_dnats_for_invalid_blocks_attn:
+        grid_kv = grid
+        parallel_attn_bwd_kernel_dkdv_within_valid_blocks[grid_kv](
+            q=q, k=k, v=v,
+            g_cumsum=g_cumsum, lse=lse, delta=delta,
+            do=do, dg_cumsum=dg_cumsum,
+            nats_block_types=nats_block_types, nats_block_indices=nats_block_indices,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            dk=dk, dv=dv, dnats=dnats,
+            scale=scale,
+            T=T, TNAtS=TNAtS, B=B, HQ=HQ, HKV=H, G=G,
+            HNAtS=HNAtS,
+            GNAtS=GNAtS,
+            K=K,
+            V=V,
+            BT=BT,
+            BS=BS,
+            BK=BK,
+            BV=BV,
+            NAtS_BLOCK_SIZE=NAtS_block_size,
+            STAGE=stage,
+            COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
+            N_TYPES=N_TYPES,
+            OFFSET_ATTN=OFFSET_ATTN,
+            num_warps=num_warps,
+        )
+    else:
+        chunk_indices_attn_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_ATTN], NAtS_block_size, BT)
 
-    parallel_attn_bwd_kernel_dkdv[grid_kv](
-        q=q, k=k, v=v,
-        g_cumsum=g_cumsum, lse=lse, delta=delta,
-        do=do, dg_cumsum=dg_cumsum,
-        nats_block_types=nats_block_types, nats_block_indices=nats_block_indices,
-        chunk_indices_attn_nats=chunk_indices_attn_nats,
-        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        cu_seqlens_nats=cu_seqlens_nats,
-        dk=dk, dv=dv, dnats_block_types=dnats_block_types,
-        scale=scale,
-        T=T, TNAtS=TNAtS, B=B, HQ=HQ, HKV=H, G=G,
-        HNAtS=HNAtS,
-        GNAtS=GNAtS,
-        K=K,
-        V=V,
-        BT=BT,
-        BS=BS,
-        BK=BK,
-        BV=BV,
-        NAtS_BLOCK_SIZE=NAtS_block_size,
-        STAGE=stage,
-        COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
-        N_TYPES=N_TYPES,
-        OFFSET_ATTN=OFFSET_ATTN,
-        num_warps=num_warps,
-    )
+        grid_kv = (NV, len(chunk_indices_attn_nats), GNAtS)
+
+        parallel_attn_bwd_kernel_dkdv[grid_kv](
+            q=q, k=k, v=v,
+            g_cumsum=g_cumsum, lse=lse, delta=delta,
+            do=do, dg_cumsum=dg_cumsum,
+            nats_block_types=nats_block_types, nats_block_indices=nats_block_indices,
+            chunk_indices_attn_nats=chunk_indices_attn_nats,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            cu_seqlens_nats=cu_seqlens_nats,
+            dk=dk, dv=dv, dnats=dnats,
+            scale=scale,
+            T=T, TNAtS=TNAtS, B=B, HQ=HQ, HKV=H, G=G,
+            HNAtS=HNAtS,
+            GNAtS=GNAtS,
+            K=K,
+            V=V,
+            BT=BT,
+            BS=BS,
+            BK=BK,
+            BV=BV,
+            NAtS_BLOCK_SIZE=NAtS_block_size,
+            STAGE=stage,
+            COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
+            N_TYPES=N_TYPES,
+            OFFSET_ATTN=OFFSET_ATTN,
+            num_warps=num_warps,
+        )
 
     dk = reduce(dk, 'b t (h g) k -> b t h k', g=G, reduction='sum')
     dv = reduce(dv, 'b t (h g) v -> b t h v', g=G, reduction='sum')
-
     if NAtS_block_size > BT:
-        dnats_block_types = reduce(
-            dnats_block_types, 'b (t gt) (h g) -> b t h',
+        dnats = reduce(
+            dnats, 'b (t gt) (h g) -> b t h',
             g=GNAtS, gt=triton.cdiv(NAtS_block_size, BT), reduction='sum')
 
     else:
-        dnats_block_types = reduce(dnats_block_types, 'b t (h g) -> b t h', g=GNAtS, reduction='sum')
+        dnats = reduce(dnats, 'b t (h g) -> b t h', g=GNAtS, reduction='sum')
 
     if g_cumsum is not None:
         dg_cumsum.add_(dg_cumsum_k)
-    return dq, dk, dv, dg_cumsum, dnats_block_types
+    return dq, dk, dv, dg_cumsum, dnats
 
 
 @torch.compile
@@ -1232,7 +1622,10 @@ class AttentionNAtSFunction(torch.autograd.Function):
                 n_nats_blocks: torch.Tensor,
                 scale, cu_seqlens, cu_seqlens_nats,
                 NAtS_block_size: int,
-                offset_attn: int = 0, compute_incomplete_chunk_scores: bool = False, is_causal: bool = True,
+                offset_attn: int = 0,
+                compute_incomplete_chunk_scores: bool = True,
+                compute_dnats_for_invalid_blocks_attn: bool = False,
+                is_causal: bool = True,
                 store_msk: bool = False
                 ):
         ctx.dtype = q.dtype
@@ -1253,6 +1646,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
         ctx.cu_seqlens_nats = cu_seqlens_nats
         ctx.offset_attn = offset_attn
         ctx.compute_incomplete_chunk_scores = compute_incomplete_chunk_scores
+        ctx.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
         ctx.is_causal = is_causal
         return o.to(q.dtype), msk
 
@@ -1272,16 +1666,19 @@ class AttentionNAtSFunction(torch.autograd.Function):
             NAtS_block_size=ctx.NAtS_block_size,
             OFFSET_ATTN=ctx.offset_attn,
             compute_incomplete_chunk_scores=ctx.compute_incomplete_chunk_scores,
+            compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
             cu_seqlens=ctx.cu_seqlens,
             cu_seqlens_nats=ctx.cu_seqlens_nats,
             is_causal=ctx.is_causal,
         )
+        import pdb
+        pdb.set_trace()
         if nats_block_types.shape[-1] > 1:
             d_chunk_type = torch.nn.functional.pad(d_chunk_type.unsqueeze(-1), (0, nats_block_types.shape[-1] - 1))
         else:
             d_chunk_type = d_chunk_type.unsqueeze(-1)
         return dq.to(q), dk.to(k), dv.to(v), dg, d_chunk_type.to(
-            nats_block_types), None, None, None, None, None, None, None, None, None, None
+            nats_block_types), None, None, None, None, None, None, None, None, None, None, None
 
 
 def parallel_nats_attn(
@@ -1379,7 +1776,8 @@ def parallel_nats_attn(
 def test_mixed_attns():
     # TODO move this to tests!
     torch.manual_seed(0)
-    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    #dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    dtype = torch.float16
 
     import math
     import copy
@@ -1420,7 +1818,7 @@ def test_mixed_attns():
     v0 = torch.nn.Parameter(v0, requires_grad=True)
     attn_types_ = torch.nn.Parameter(attn_types, requires_grad=True)
 
-    compute_incomplete_chunk_scores = False
+    compute_incomplete_chunk_scores = True
 
     out1, msk = parallel_nats_attn(q0.view(BATCH, T, HQ * GATTN, D_HEAD // GATTN),
                                    k0.view(BATCH, T, H * GATTN, D_HEAD // GATTN),
