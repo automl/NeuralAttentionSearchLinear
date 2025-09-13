@@ -1502,7 +1502,7 @@ def parallel_attn_nats_bwd(
         nats_block_indices,
         T, BT, BS, NAtS_block_size, OFFSET_ATTN
     )
-    """
+
     parallel_nats_attn_bwd_kernel_dq[grid](q=q, k=k, v=v,
                                            g_cumsum=g_cumsum, lse=lse, delta=delta,
                                            do=do, dq=dq, dg_cumsum=dg_cumsum,
@@ -1529,7 +1529,6 @@ def parallel_attn_nats_bwd(
                                            OFFSET_ATTN=OFFSET_ATTN,
                                            num_warps=num_warps,
                                            )
-    """
 
     # n_grids =prepare_nats_block_indices
 
@@ -1671,8 +1670,6 @@ class AttentionNAtSFunction(torch.autograd.Function):
             cu_seqlens_nats=ctx.cu_seqlens_nats,
             is_causal=ctx.is_causal,
         )
-        import pdb
-        pdb.set_trace()
         if nats_block_types.shape[-1] > 1:
             d_chunk_type = torch.nn.functional.pad(d_chunk_type.unsqueeze(-1), (0, nats_block_types.shape[-1] - 1))
         else:
@@ -1691,6 +1688,7 @@ def parallel_nats_attn(
         NAtS_block_size: int = 1,
         offset_attn: int = 0,
         compute_incomplete_chunk_scores: bool = False,
+        compute_dnats_for_invalid_blocks_attn: bool=False,
         head_first: bool = False,
         is_causal: bool = True,
         store_msk: bool = False,
@@ -1768,7 +1766,9 @@ def parallel_nats_attn(
                                          nats_block_types, nats_block_indices, n_nats_blocks,
                                          scale, cu_seqlens,
                                          cu_seqlens_nats, NAtS_block_size, offset_attn,
-                                         compute_incomplete_chunk_scores, is_causal, store_msk
+                                         compute_incomplete_chunk_scores,
+                                         compute_dnats_for_invalid_blocks_attn,
+                                         is_causal, store_msk
                                          )
     return o, msk
 
@@ -1776,8 +1776,8 @@ def parallel_nats_attn(
 def test_mixed_attns():
     # TODO move this to tests!
     torch.manual_seed(0)
-    #dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-    dtype = torch.float16
+    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    #dtype = torch.float16
 
     import math
     import copy
@@ -1818,7 +1818,8 @@ def test_mixed_attns():
     v0 = torch.nn.Parameter(v0, requires_grad=True)
     attn_types_ = torch.nn.Parameter(attn_types, requires_grad=True)
 
-    compute_incomplete_chunk_scores = True
+    compute_incomplete_chunk_scores = False
+
 
     out1, msk = parallel_nats_attn(q0.view(BATCH, T, HQ * GATTN, D_HEAD // GATTN),
                                    k0.view(BATCH, T, H * GATTN, D_HEAD // GATTN),
