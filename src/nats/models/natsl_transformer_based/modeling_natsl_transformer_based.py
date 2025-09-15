@@ -286,7 +286,7 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                hidden_states, attentions, past_key_values = self._gradient_checkpointing_func(
+                layer_outputs = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     attention_mask,
@@ -296,7 +296,7 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
                     **kwargs
                 )
             else:
-                hidden_states, attentions, past_key_values = layer(
+                layer_outputs = layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
@@ -304,9 +304,13 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
                     output_attentions=output_attentions,
                     **kwargs
                 )
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
-                all_attns += (attentions,)
+                all_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -315,10 +319,10 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(i for i in [hidden_states, past_key_values, all_hidden_states, all_attns] if i is not None)
+            return tuple(i for i in [hidden_states, next_cache, all_hidden_states, all_attns] if i is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
+            past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_attns
         )
