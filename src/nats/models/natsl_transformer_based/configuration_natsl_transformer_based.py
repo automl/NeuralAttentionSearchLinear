@@ -17,6 +17,7 @@ class NeuralAttentionSearchLinearTransformerBasedConfig(PretrainedConfig):
             num_lattn_heads: int = 8,
             num_kv_heads: Optional[int] = None,
             num_nats_head: Optional[int] = None,
+            qkv_bias: bool = False,
             qk_norm: bool = False,
             window_size: Optional[int] = None,
             n_ops: int = 2,
@@ -61,6 +62,7 @@ class NeuralAttentionSearchLinearTransformerBasedConfig(PretrainedConfig):
         self.num_nats_head = num_nats_head
 
         self.qk_norm = qk_norm
+        self.qkv_bias = qkv_bias
         self.window_size = window_size
         self.mode=mode
 
