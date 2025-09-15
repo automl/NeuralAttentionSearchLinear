@@ -55,7 +55,8 @@ class NAtSMixedAttention(torch.autograd.Function):
                 use_g_for_attn: bool = True,
                 lattn_use_qk_l2norm_in_kernel: bool = True,
                 ):
-        incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
+        #incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
+        incomplete_block_strategy = RunIncompleteBlock(attn=False, gated_delta_net=False)
 
         if not incomplete_block_strategy.gated_delta_net:
             if torch.is_grad_enabled():
@@ -103,6 +104,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             k_lattn, k_rstd_lattn = l2norm_fwd(k_lattn)
         else:
             q_rstd_lattn, k_rstd_lattn = None, None
+
 
         chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_GATED_DELTA_NET],
                                                               nats_block_size,
@@ -167,14 +169,15 @@ class NAtSMixedAttention(torch.autograd.Function):
         ctx.keep_wu_as_kv = keep_wu_as_kv
         ctx.incomplete_block_strategy = incomplete_block_strategy
 
-        return o_gated_delta + o_attn.view(o_gated_delta.shape), final_state_gated_delta
+        return o_gated_delta, o_attn, final_state_gated_delta
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
     def backward(
             ctx,
-            do: torch.Tensor,
+            do_gated_delta: torch.Tensor,
+            do_attn: torch.Tensor,
             dht_gated_net: torch.Tensor
     ):
 
@@ -193,7 +196,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             n_nats_blocks=n_nats_blocks,
             g_cumsum=g_cumsum_attn,
             lse=lse_attn,
-            do=do.view(o_attn.shape),
+            do=do_attn,
             scale=ctx.scale_attn,
             NAtS_block_size=ctx.nats_block_size,
             OFFSET_ATTN=ctx.OFFSET_ATTN,
@@ -217,7 +220,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             n_nats_blocks=n_nats_blocks,
             scale=ctx.scale_lattn,
             initial_state=initial_state_gated_delta,
-            do=do,
+            do=do_gated_delta,
             dht=dht_gated_net,
             chunk_indices_delta_nats=chunk_indices_delta_nats,
             nats_block_delta_offsets=nats_block_delta_offsets,
@@ -272,7 +275,7 @@ def nats_mixed_attn(
     if scale_lattn is None:
         scale_lattn = k_lattn.shape[-1] ** -0.5
 
-    o, gated_delta_ht = NAtSMixedAttention.apply(
+    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttention.apply(
         q_attn, k_attn, v_attn, q_lattn, k_lattn, v_lattn,
         initial_state_gated_delta, g, beta,
         nats_block_types, n_nats_blocks, scale_attn,
@@ -284,7 +287,7 @@ def nats_mixed_attn(
         incomplete_block_start_with_ht,
         use_g_for_attn, lattn_use_qk_l2norm_in_kernel
     )
-    return o, gated_delta_ht
+    return o_gated_delta_net, o_attn, gated_delta_ht
 
 
 def test_mixed_attn():

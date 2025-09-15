@@ -130,6 +130,7 @@ class NeuralAttentionSearchLinear(nn.Module):
             conv_size: int = 4,
             conv_bias: bool = False,
             conv_activation: str | None = 'silu',  # TODO check if None or silu works better?
+            outputs_are_wighted:bool = False,
             attn_qk_norm: bool = False,
             attn_with_short_conv: bool = False,
             compute_dnats_for_invalid_blocks_attn: bool= False,
@@ -268,6 +269,10 @@ class NeuralAttentionSearchLinear(nn.Module):
         # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
         # name.endswith("bias") in param_grouping.py
         self.dt_bias._no_weight_decay = True
+
+        self.outputs_are_wighted = outputs_are_wighted
+        if self.outputs_are_wighted:
+            self.nats_out_weights_layer = nn.Linear(hidden_size, self.n_ops * self.num_nats_head, bias=False)
 
         if use_short_conv:
             self.conv_size = conv_size
@@ -454,7 +459,7 @@ class NeuralAttentionSearchLinear(nn.Module):
 
         recurrent_state_gated_delta = last_state['recurrent_state_gated_delta'] if last_state is not None else None
         if mode == 'chunk':
-            o, recurrent_state_gated_delta = nats_mixed_attn(
+            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
                 initial_state_gated_delta=recurrent_state_gated_delta,
@@ -472,19 +477,24 @@ class NeuralAttentionSearchLinear(nn.Module):
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
+            if self.outputs_are_wighted:
+                o_weights = self.nats_out_weights_layer(hidden_states)
+                o = o_gated_delta * o_weights[..., [1]] + o_attn.view(o_gated_delta.shape) * o_weights[..., [0]]
+            else:
+                o = o_gated_delta + o_attn.view(o_gated_delta.shape)
         elif mode == 'fused_recurrent':
             raise NotImplementedError
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
         if past_key_values is not None:
-            raise NotImplementedError
-            #past_key_values.update(
-            #    recurrent_state=recurrent_state,
-            #    conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
-            #    layer_idx=self.layer_idx,
-            #    offset=q_len
-            #)
+            # TODO this needs to be updated!!!
+            past_key_values.update(
+                recurrent_state=recurrent_state_gated_delta,
+                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+                layer_idx=self.layer_idx,
+                offset=q_len
+            )
 
         if self.use_gate:
             g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
@@ -508,14 +518,18 @@ def test_mixed_attn():
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
 
     layer = NeuralAttentionSearchLinear(hidden_size=512, head_dim=128, num_heads=2, num_attn_heads=4,
+                                        expand_v=1,
                                         ops_for_incomplete_chunks='attn',
+                                        use_short_conv=False,
                                         compute_dnats_for_invalid_blocks_linear_att=False,
                                         compute_dnats_for_invalid_blocks_attn=False
+
                                         ).cuda()
     input_data = torch.randn((2, 512, 512)).cuda()
     out = layer(input_data)[0]
+    label = torch.rand_like(out)
 
-    loss = (out**2).sum()
+    loss = ((out - label)**2).sum()
     loss.backward()
     import pdb
     pdb.set_trace()

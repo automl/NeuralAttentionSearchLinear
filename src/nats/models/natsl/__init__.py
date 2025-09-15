@@ -12,4 +12,4 @@ AutoConfig.register(NeuralAttentionSearchLineraConfig.model_type, NeuralAttentio
 AutoModel.register(NeuralAttentionSearchLineraConfig, NeuralAttentionSearchLinearModel, exist_ok=True)
 AutoModelForCausalLM.register(NeuralAttentionSearchLineraConfig, NeuralAttentionSearchLinearForCausalLM, exist_ok=True)
 
-__all__ = ['NeuralAttentionSearchLineraConfig', 'NeuralAttentionSearchLineraConfig', 'NeuralAttentionSearchLinearModel']
+__all__ = ['NeuralAttentionSearchLineraConfig', 'NeuralAttentionSearchLinearForCausalLM', 'NeuralAttentionSearchLinearModel']

@@ -20,12 +20,14 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
-from fla.modules import GatedMLP as GatedDeltaNetMLP
+from fla.modules import GatedMLP as TransformerMLP
 from fla.modules import RMSNorm
 from fla.modules.l2warp import l2_warp
 
-from nats.models.natsl.configuration_natsl import NeuralAttentionSearchLineraConfig
-from nats.layers.natsl import NeuralAttentionSearchLinear
+from nats.models.natsl_transformer_based.configuration_natsl_transformer_based import (
+    NeuralAttentionSearchLinearTransformerBasedConfig
+)
+from nats.layers.natsl_transformer_based import NeuralAttentionSearchLinearAttentionBased
 
 try:
     from torch.distributed.tensor import DTensor
@@ -50,44 +52,41 @@ class NAtSCausalLMOutputWithPast(CausalLMOutputWithPast):
 
 
 class NeuralAttentionSearchLinearBlock(nn.Module):
-    def __init__(self, config: NeuralAttentionSearchLineraConfig, layer_idx: int):
+    def __init__(self, config: NeuralAttentionSearchLinearTransformerBasedConfig, layer_idx: int):
         super().__init__()
 
         self.config = config
         self.layer_idx = layer_idx
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.attn = NeuralAttentionSearchLinear(
+        self.attn = NeuralAttentionSearchLinearAttentionBased(
             hidden_size=config.hidden_size,
-            expand_v=config.expand_v,
-            head_dim=config.head_dim,
             num_heads=config.num_heads,
-            num_attn_heads=config.num_attn_heads,
-            num_v_heads=config.num_v_heads,
+            num_lattn_heads=config.num_lattn_heads,
+            num_kv_heads=config.num_kv_heads,
+            num_nats_head=config.num_kv_heads,
+            qkv_bias=config.qkv_bias,
+            qk_norm=config.qk_norm,
+            window_size=config.window_size,
             n_ops=config.n_ops,
-            num_nats_head=config.num_nats_head,
             nats_block_size=config.nats_block_size,
             nats_block_agg_type=config.nats_block_agg_type,
             nats_sample_strategy=config.nats_sample_strategy,
             ops_for_incomplete_chunks=config.ops_for_incomplete_chunks,
-            use_gate=config.use_gate,
-            use_short_conv=config.use_short_conv,
+            mode=config.mode,
             allow_neg_eigval=config.allow_neg_eigval,
-            conv_size=config.conv_size,
-            conv_bias=config.conv_bias,
+            lattns_use_silu=config.lattns_use_silu,
             outputs_are_wighted=config.outputs_are_wighted,
-            attn_qk_norm=config.attn_qk_norm,
-            attn_with_short_conv=config.attn_with_short_conv,
             compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
-            compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_attn,
+            compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_linear_att,
             incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
-            attn_rope_theta=config.attn_rope_theta,
             attn_apply_pos_encoding=config.attn_apply_pos_encoding,
-            attn_max_position_embeddings=config.attn_max_position_embeddings,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
         )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.mlp = GatedDeltaNetMLP(
+        self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
@@ -123,17 +122,23 @@ class NeuralAttentionSearchLinearBlock(nn.Module):
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, attentions, past_key_values)
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attentions,)
+
+        if use_cache:
+            outputs += (past_key_values,)
 
         return outputs
 
 
-class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
+class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel):
 
-    config_class = NeuralAttentionSearchLineraConfig
+    config_class = NeuralAttentionSearchLinearTransformerBasedConfig
     base_model_prefix = 'model'
     supports_gradient_checkpointing = True
-    _no_split_modules = ['NeuralAttentionSearchLinearBlock']
+    _no_split_modules = ['NeuralAttentionSearchLinearAttentionBased']
     _supports_cache_class = True
 
     def __init__(self, *inputs, **kwargs):
@@ -145,7 +150,7 @@ class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
         prenorm_residual_strategy: Optional[str] = None,
         num_residuals_per_layer: int = 2,
     ):
-        if isinstance(module, NeuralAttentionSearchLinear):
+        if isinstance(module, NeuralAttentionSearchLinearAttentionBased):
 
             # --- A_log ---
             A = torch.empty(module.num_v_heads, dtype=torch.float32).uniform_(0, 16)
@@ -216,9 +221,9 @@ class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
                     raise ValueError(f"Invalid prenorm_residual_strategy: {prenorm_residual_strategy}")
 
 
-class NeuralAttentionSearchLinearModel(NeuralAttentionSearchLinearPreTrainedModel):
+class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLinearTransformerBasedPreTrainedModel):
 
-    def __init__(self, config: NeuralAttentionSearchLineraConfig):
+    def __init__(self, config: NeuralAttentionSearchLinearTransformerBasedConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -319,13 +324,13 @@ class NeuralAttentionSearchLinearModel(NeuralAttentionSearchLinearPreTrainedMode
         )
 
 
-class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrainedModel, GenerationMixin):
+class NeuralAttentionSearchLinearTransformerBasedForCausalLM(NeuralAttentionSearchLinearTransformerBasedPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = NeuralAttentionSearchLinearModel(config)
+        self.model = NeuralAttentionSearchLinearTransformerBasedModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
