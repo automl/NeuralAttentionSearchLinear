@@ -153,7 +153,7 @@ class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel
         if isinstance(module, NeuralAttentionSearchLinearAttentionBased):
 
             # --- A_log ---
-            A = torch.empty(module.num_v_heads, dtype=torch.float32).uniform_(0, 16)
+            A = torch.empty(module.num_lattn_heads, dtype=torch.float32).uniform_(0, 16)
             with torch.no_grad():
                 if not isinstance(module.A_log, DTensor):
                     module.A_log.copy_(torch.log(A))
@@ -167,7 +167,7 @@ class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel
             dt_max = 0.1
             dt_init_floor = 1e-4
             dt = torch.exp(
-                torch.rand(module.num_v_heads) * (math.log(dt_max) - math.log(dt_min))
+                torch.rand(module.num_lattn_heads) * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
             )
             dt = torch.clamp(dt, min=dt_init_floor)
