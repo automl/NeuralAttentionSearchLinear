@@ -110,6 +110,8 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
 
     p_hcur = hcur + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
 
+    b_hcur = tl.load(p_hcur, mask=mask_v, other=0).to(tl.float32)
+
     nats_block_types += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
 
     b_ntokens_in_current_block = tl.load(n_tokens_in_current_block + i_n)
@@ -163,14 +165,11 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         p_o += HV*V
 
     # TODO we need to check how to optimize this?
-    if n_iter1 < NATS_BLOCK_SIZE - b_ntokens_in_current_block: # TODO take this as constexpr?
-        tl.store(p_hcur, b_h.to(p_hcur.dtype.element_ty), mask=mask_h)
-    else:
+    # we arrive the end of the first block
+    if n_iter1 == NATS_BLOCK_SIZE - b_ntokens_in_current_block:
         is_delta = tl.load(nats_block_types)
-        if is_delta:
-            tl.store(p_hcur, b_h.to(p_hcur.dtype.element_ty), mask=mask_h)
-        else:
-            b_h = tl.load(p_hcur)
+        b_h = tl.where(is_delta, b_h, b_hcur)
+        b_hcur = b_h
 
     # Now we want to continue the following
     for _ in range(0, TNAtS - 2):
@@ -220,10 +219,8 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
             p_o += HV * V
         nats_block_types += N_TYPES * HNAtS
         is_delta = tl.load(nats_block_types)
-        if is_delta:
-            tl.store(p_hcur, b_h.to(p_hcur.dtype.element_ty), mask=mask_h)
-        else:
-            b_h = tl.load(p_hcur)
+        b_h = tl.where(is_delta, b_h, b_hcur)
+        b_hcur = b_h
 
     # the last block
     n_iters_last = T - b_ntokens_in_current_block - (TNAtS - 2) * NATS_BLOCK_SIZE
@@ -275,8 +272,12 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     # we only store the temporal hidden state if we arrive the new hidden state and the new block is a delta block
     nats_block_types += N_TYPES * HNAtS
     is_delta = tl.load(nats_block_types)
-    if n_iters_last == NATS_BLOCK_SIZE and is_delta:
-        tl.store(p_hcur, b_h.to(p_hcur.dtype.element_ty), mask=mask_h)
+    if n_iters_last == NATS_BLOCK_SIZE:
+        b_h = tl.where(is_delta, b_h, b_hcur)
+        b_hcur = b_h
+
+    # we need to store b_hcur anyway
+    tl.store(p_hcur, b_hcur.to(p_hcur.dtype.element_ty), mask=mask_h)
 
     if STORE_FINAL_STATE:
         p_ht = ht + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
