@@ -478,7 +478,7 @@ class NeuralAttentionSearchLinear(nn.Module):
                 lattn_use_qk_l2norm_in_kernel=True,
             )
             if self.outputs_are_wighted:
-                o_weights = self.nats_out_weights_layer(hidden_states)
+                o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
                 o = o_gated_delta * o_weights[..., [1]] + o_attn.view(o_gated_delta.shape) * o_weights[..., [0]]
             else:
                 o = o_gated_delta + o_attn.view(o_gated_delta.shape)
