@@ -55,8 +55,7 @@ class NAtSMixedAttention(torch.autograd.Function):
                 use_g_for_attn: bool = True,
                 lattn_use_qk_l2norm_in_kernel: bool = True,
                 ):
-        #incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
-        incomplete_block_strategy = RunIncompleteBlock(attn=False, gated_delta_net=False)
+        incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
 
         if not incomplete_block_strategy.gated_delta_net:
             if torch.is_grad_enabled():
