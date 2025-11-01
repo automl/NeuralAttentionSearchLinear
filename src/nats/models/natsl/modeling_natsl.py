@@ -21,6 +21,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
 from fla.modules import GatedMLP as GatedDeltaNetMLP
+from fla.layers.gated_deltanet import GatedDeltaNet
 from fla.modules import RMSNorm
 from fla.modules.l2warp import l2_warp
 
@@ -52,35 +53,52 @@ class NeuralAttentionSearchLinearBlock(nn.Module):
         self.layer_idx = layer_idx
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.attn = NeuralAttentionSearchLinear(
-            hidden_size=config.hidden_size,
-            expand_v=config.expand_v,
-            head_dim=config.head_dim,
-            num_heads=config.num_heads,
-            num_attn_heads=config.num_attn_heads,
-            num_v_heads=config.num_v_heads,
-            n_ops=config.n_ops,
-            num_nats_head=config.num_nats_head,
-            nats_block_size=config.nats_block_size,
-            nats_block_agg_type=config.nats_block_agg_type,
-            nats_sample_strategy=config.nats_sample_strategy,
-            ops_for_incomplete_chunks=config.ops_for_incomplete_chunks,
-            use_gate=config.use_gate,
-            use_short_conv=config.use_short_conv,
-            allow_neg_eigval=config.allow_neg_eigval,
-            conv_size=config.conv_size,
-            conv_bias=config.conv_bias,
-            outputs_are_wighted=config.outputs_are_wighted,
-            attn_qk_norm=config.attn_qk_norm,
-            attn_with_short_conv=config.attn_with_short_conv,
-            compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
-            compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_attn,
-            incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
-            attn_rope_theta=config.attn_rope_theta,
-            attn_apply_pos_encoding=config.attn_apply_pos_encoding,
-            attn_max_position_embeddings=config.attn_max_position_embeddings,
-            layer_idx=layer_idx,
-        )
+        if layer_idx in config.gdn_layers:
+            self.attn = GatedDeltaNet(
+                mode=config.attn_mode,
+                hidden_size=config.hidden_size,
+                expand_v=config.expand_v,
+                head_dim=config.head_dim,
+                num_heads=config.num_heads,
+                num_v_heads=config.num_v_heads,
+                use_gate=config.use_gate,
+                use_short_conv=config.use_short_conv,
+                allow_neg_eigval=config.allow_neg_eigval,
+                conv_size=config.conv_size,
+                norm_eps=config.norm_eps,
+                layer_idx=layer_idx
+            )
+        else:
+            self.attn = NeuralAttentionSearchLinear(
+                hidden_size=config.hidden_size,
+                expand_v=config.expand_v,
+                head_dim=config.head_dim,
+                num_heads=config.num_heads,
+                num_attn_heads=config.num_attn_heads,
+                num_v_heads=config.num_v_heads,
+                n_ops=config.n_ops,
+                num_nats_head=config.num_nats_head,
+                nats_block_size=config.nats_block_size,
+                nats_block_agg_type=config.nats_block_agg_type,
+                nats_sample_strategy=config.nats_sample_strategy,
+                ops_for_incomplete_chunks=config.ops_for_incomplete_chunks,
+                use_gate=config.use_gate,
+                use_short_conv=config.use_short_conv,
+                allow_neg_eigval=config.allow_neg_eigval,
+                conv_size=config.conv_size,
+                conv_bias=config.conv_bias,
+                outputs_are_wighted=config.outputs_are_wighted,
+                attn_qk_norm=config.attn_qk_norm,
+                attn_with_short_conv=config.attn_with_short_conv,
+                compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
+                compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_attn,
+                incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
+                attn_rope_theta=config.attn_rope_theta,
+                attn_apply_pos_encoding=config.attn_apply_pos_encoding,
+                attn_max_position_embeddings=config.attn_max_position_embeddings,
+                norm_eps=config.norm_eps,
+                layer_idx=layer_idx,
+            )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedDeltaNetMLP(
             hidden_size=config.hidden_size,
@@ -140,7 +158,8 @@ class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
         prenorm_residual_strategy: Optional[str] = None,
         num_residuals_per_layer: int = 2,
     ):
-        if isinstance(module, NeuralAttentionSearchLinear) and next(module.parameters()).device.type != 'meta':
+        if (isinstance(module, NeuralAttentionSearchLinear) and next(module.parameters()).device.type != 'meta') \
+                or (isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta'):
             with torch.no_grad():
                 module.A_log.copy_(nn.init.uniform_(module.A_log, a=0, b=16).log())
                 module.A_log._no_weight_decay = True

@@ -56,6 +56,7 @@ class NeuralAttentionSearchLineraConfig(PretrainedConfig):
             fuse_cross_entropy: bool = True,
             use_l2warp: bool = False,
             vocab_size: int = 32000,
+            gdn_layers: list[int] | None = None,
             **kwargs
     ):
         self.attn_mode = attn_mode
@@ -103,6 +104,10 @@ class NeuralAttentionSearchLineraConfig(PretrainedConfig):
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
         self.allow_neg_eigval = allow_neg_eigval
+
+        if gdn_layers is None:
+            gdn_layers = []
+        self.gdn_layer = gdn_layers
 
         if attn is not None:
             if not isinstance(attn, Dict):
