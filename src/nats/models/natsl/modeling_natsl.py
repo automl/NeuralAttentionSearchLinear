@@ -449,7 +449,7 @@ class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrain
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers if isinstance(layer, NeuralAttentionSearchLinear)]))
+        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers if isinstance(layer.attn, NeuralAttentionSearchLinear)]))
 
         if not return_dict:
             output = (logits,) + outputs[1:]
