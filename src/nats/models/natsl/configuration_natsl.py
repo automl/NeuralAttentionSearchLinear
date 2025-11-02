@@ -107,7 +107,7 @@ class NeuralAttentionSearchLineraConfig(PretrainedConfig):
 
         if gdn_layers is None:
             gdn_layers = []
-        self.gdn_layer = gdn_layers
+        self.gdn_layers = gdn_layers
 
         if attn is not None:
             if not isinstance(attn, Dict):
