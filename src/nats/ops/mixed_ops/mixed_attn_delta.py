@@ -6,42 +6,38 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous, inpu
 from fla.ops.utils.cumsum import chunk_global_cumsum
 
 from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd
-from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
+from nats.ops.delta_rule.chunk import chunk_delta_rule_nats_fwd, chunk_delta_rule_nats_bwd
 
 from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, compute_starting_idx_for_chunks
 
 CHUNK_SIZE = 64
-all_nats_ops = ['gated_delta', 'gated_delta_net']
-
 
 @dataclass
 class RunIncompleteBlock:
     attn: bool = False
-    gated_delta_net: bool = False
+    delta_net: bool = False
 
 
 all_incomplete_ops: dict[str, RunIncompleteBlock] = {
     'all': RunIncompleteBlock(attn=True,
-                              gated_delta_net=True),
+                              delta_net=True),
     'attn': RunIncompleteBlock(attn=True,
-                               gated_delta_net=False),
-    'gated_delta_net': RunIncompleteBlock(attn=False,
-                                          gated_delta_net=True)
+                               delta_net=False),
+    'delta_net': RunIncompleteBlock(attn=False,
+                                    delta_net=True)
 }
 
 
 
-
 @torch.compile
-class NAtSMixedAttention(torch.autograd.Function):
+class NAtSMixedAttentionDelta(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_fwd
     def forward(ctx,
                 q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
                 q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
-                initial_state_gated_delta: torch.Tensor,
-                g: torch.Tensor,
+                initial_state_delta: torch.Tensor,
                 beta: torch.Tensor,
                 nats_block_types: torch.Tensor,
                 n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
@@ -52,12 +48,11 @@ class NAtSMixedAttention(torch.autograd.Function):
                 compute_dnats_for_invalid_blocks_attn: bool = False,
                 compute_dnats_for_invalid_blocks_linear_att: bool = True,
                 incomplete_block_start_with_ht: bool = True,
-                use_g_for_attn: bool = True,
                 lattn_use_qk_l2norm_in_kernel: bool = True,
                 ):
         incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
 
-        if not incomplete_block_strategy.gated_delta_net:
+        if not incomplete_block_strategy.delta_net:
             if torch.is_grad_enabled():
                 keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
             else:
@@ -65,7 +60,7 @@ class NAtSMixedAttention(torch.autograd.Function):
         else:
             keep_wu_as_kv = True
 
-        incomplete_block_start_with_ht = incomplete_block_strategy.gated_delta_net and incomplete_block_start_with_ht
+        incomplete_block_start_with_ht = incomplete_block_strategy.delta_net and incomplete_block_start_with_ht
 
         # TODO this is only for head first is True,
         assert nats_block_size >= CHUNK_SIZE
@@ -79,20 +74,15 @@ class NAtSMixedAttention(torch.autograd.Function):
 
         if n_nats_blocks is None:
             n_nats_blocks = nats_block_types.int().sum(1)
-        if use_g_for_attn:
-            RCP_LN2: float = 1.4426950216
-            g_cumsum_attn = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
-        else:
-            g_cumsum_attn = None
 
         # TODO make this a dict? check if it can pass torch compile's check
         OFFSET_ATTN = 0
-        OFFSET_GATED_DELTA_NET = 1
+        OFFSET_DELTA_NET = 1
 
         # attns
         o_attn, lse_attn, _ = parallel_attn_nats_fwd(
             q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
-            g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
+            None, scale_attn, NAtS_block_size=nats_block_size,
             offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn,
             is_causal=True, store_msk=False,
         )
@@ -104,33 +94,31 @@ class NAtSMixedAttention(torch.autograd.Function):
         else:
             q_rstd_lattn, k_rstd_lattn = None, None
 
-
-        chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_GATED_DELTA_NET],
+        chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_DELTA_NET],
                                                               nats_block_size,
                                                               CHUNK_SIZE, )
         nats_block_delta_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
                                                               nats_block_types,
                                                               nats_block_size,
-                                                              CHUNK_SIZE, OFFSET_GATED_DELTA_NET)
+                                                              CHUNK_SIZE, OFFSET_DELTA_NET)
         starting_h_idx_gated_delta = compute_starting_idx_for_chunks(
             nats_block_indices=nats_block_indices,
             T=T,
             BT=CHUNK_SIZE,
             NAtS_Block_Size=nats_block_size,
-            offset_op=OFFSET_GATED_DELTA_NET
+            offset_op=OFFSET_DELTA_NET
         )
 
-        g_gated_delta, o_gated_delta, A_gated_delta, final_state_gated_delta = chunk_gated_delta_rule_nats_fwd(
+        o_gated_delta, A_gated_delta, final_state_gated_delta = chunk_delta_rule_nats_fwd(
             q=q_lattn,
             k=k_lattn,
             v=v_lattn,
-            g=g,
             beta=beta,
             nats_block_types=nats_block_types,
             nats_block_indices=nats_block_indices,
             n_nats_blocks=n_nats_blocks,
             scale=scale_lattn,
-            initial_state=initial_state_gated_delta,
+            initial_state=initial_state_delta,
             output_final_state=output_final_state_gated_delta,
             chunk_indices_delta_nats=chunk_indices_delta_nats,
             nats_block_delta_offsets=nats_block_delta_offsets,
@@ -138,16 +126,16 @@ class NAtSMixedAttention(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
             nats_block_size=nats_block_size,
-            offset_delta=OFFSET_GATED_DELTA_NET,
+            offset_delta=OFFSET_DELTA_NET,
             compute_incomplete_chunk_scores=incomplete_block_strategy.gated_delta_net,
             incomplete_block_start_with_ht=incomplete_block_start_with_ht,
             keep_wu_as_kv=keep_wu_as_kv,
         )
 
         ctx.save_for_backward(
-            q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
-            q_lattn, q_rstd_lattn, k_lattn, k_rstd_lattn, v_lattn, g_gated_delta, beta, A_gated_delta,
-            initial_state_gated_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
+            q_attn, k_attn, v_attn, o_attn, lse_attn,
+            q_lattn, q_rstd_lattn, k_lattn, k_rstd_lattn, v_lattn, beta, A_gated_delta,
+            initial_state_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
             cu_seqlens, cu_seqlens_nats,
             nats_block_types, nats_block_indices, n_nats_blocks,
         )
@@ -159,7 +147,7 @@ class NAtSMixedAttention(torch.autograd.Function):
         ctx.lattn_use_qk_l2norm_in_kernel = lattn_use_qk_l2norm_in_kernel
 
         ctx.OFFSET_ATTN = OFFSET_ATTN
-        ctx.OFFSET_GATED_DELTA = OFFSET_GATED_DELTA_NET
+        ctx.OFFSET_DELTA_NET = OFFSET_DELTA_NET
 
         ctx.ops_for_incomplete_chunks = ops_for_incomplete_chunks
         ctx.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
@@ -183,7 +171,7 @@ class NAtSMixedAttention(torch.autograd.Function):
         (
             q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
             q_lattn, q_rstd_lattn, k_lattn, k_rstd_lattn, v_lattn, g_gated_delta, beta, A_gated_delta,
-            initial_state_gated_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
+            initial_state_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
             cu_seqlens, cu_seqlens_nats,
             nats_block_types, nats_block_indices, n_nats_blocks,
         ) = ctx.saved_tensors
@@ -206,19 +194,17 @@ class NAtSMixedAttention(torch.autograd.Function):
             is_causal=True,
         )
 
-        dq_gated_delta, dk_gated_delta, dv_gated_delta, db, dg_gated_delta, dh0_gated_delta, dnats_gated_delta \
-            = chunk_gated_delta_rule_nats_bwd(
+        dq_delta, dk_delta, dv_delta, db, dh0_delta, dnats_delta = chunk_delta_rule_nats_bwd(
             q=q_lattn,
             k=k_lattn,
             v=v_lattn,
-            g=g_gated_delta,
             beta=beta,
             A=A_gated_delta,
             nats_block_types=nats_block_types,
             nats_block_indices=nats_block_indices,
             n_nats_blocks=n_nats_blocks,
             scale=ctx.scale_lattn,
-            initial_state=initial_state_gated_delta,
+            initial_state=initial_state_delta,
             do=do_gated_delta,
             dht=dht_gated_net,
             chunk_indices_delta_nats=chunk_indices_delta_nats,
@@ -228,7 +214,7 @@ class NAtSMixedAttention(torch.autograd.Function):
             cu_seqlens_nats=cu_seqlens_nats,
             nats_block_size=ctx.nats_block_size,
             offset_delta=ctx.OFFSET_GATED_DELTA,
-            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.gated_delta_net,
+            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.delta_net,
             compute_dnats_for_invalid_blocks=ctx.compute_dnats_for_invalid_blocks_linear_att,
             incomplete_block_start_with_ht=ctx.incomplete_block_start_with_ht,
             keep_wu_as_kv=ctx.keep_wu_as_kv,
@@ -236,25 +222,24 @@ class NAtSMixedAttention(torch.autograd.Function):
         # TODO if we want a uniform dv, we might need some adjustments here!!!
         #  check how to solve problems for dg for transformer
         # this should be adjusted based on our choice, we need to check how to solve this
-        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_gated_delta.unsqueeze(-1)], dim=-1)
+        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_delta.unsqueeze(-1)], dim=-1)
 
         if ctx.lattn_use_qk_l2norm_in_kernel:
-            dq_gated_delta = l2norm_bwd(q_lattn, q_rstd_lattn, dq_gated_delta)
-            dk_gated_delta = l2norm_bwd(k_lattn, k_rstd_lattn, dk_gated_delta)
+            dq_delta = l2norm_bwd(q_lattn, q_rstd_lattn, dq_delta)
+            dk_delta = l2norm_bwd(k_lattn, k_rstd_lattn, dk_delta)
         # TODO if we have other linear attn types, we need to adjust them here!
         return dq_attn, dk_attn, dv_attn, \
-               dq_gated_delta, dk_gated_delta, dv_gated_delta, \
-               dh0_gated_delta, \
-               dg_gated_delta, db, dnats, None, \
+               dq_delta, dk_delta, dv_delta, \
+               dh0_delta, \
+               db, dnats, None, \
                None, None, None, None, \
                None, None, None, None, None, None, None, None
 
 
-def nats_mixed_attn(
+def nats_mixed_attn_delta(
         q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
         q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
-        initial_state_gated_delta: torch.Tensor,
-        g: torch.Tensor,
+        initial_state_delta: torch.Tensor,
         beta: torch.Tensor,
         nats_block_types: torch.Tensor,
         n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
@@ -274,9 +259,9 @@ def nats_mixed_attn(
     if scale_lattn is None:
         scale_lattn = k_lattn.shape[-1] ** -0.5
 
-    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttention.apply(
+    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttentionDelta.apply(
         q_attn, k_attn, v_attn, q_lattn, k_lattn, v_lattn,
-        initial_state_gated_delta, g, beta,
+        initial_state_delta, beta,
         nats_block_types, n_nats_blocks, scale_attn,
         scale_lattn, cu_seqlens, cu_seqlens_nats,
         nats_block_size, ops_for_incomplete_chunks,
@@ -341,10 +326,10 @@ def test_mixed_attn():
     nats_block_types[:,-1] = 1
     n_nats_blocks = nats_block_types.int().sum(1)
 
-    out, _ = nats_mixed_attn(
+    out, _ = nats_mixed_attn_delta(
         q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
         q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
-        initial_state_gated_delta=None,
+        initial_state_delta=None,
         g=g0, beta=beta, nats_block_types=nats_block_types, n_nats_blocks=n_nats_blocks,
         scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
         cu_seqlens=None, cu_seqlens_nats=None,
@@ -365,4 +350,3 @@ if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
     # test_compute_h()
     test_mixed_attn()
-

@@ -19,9 +19,7 @@ from fla.ops.utils.index import prepare_lens_from_mask
 from fla.ops.utils.pooling import mean_pooling
 
 # from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-#from nats.ops.attns.attns import parallel_mixed_attn
-#from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
-from nats.ops.mixed_ops.mixed_attn import nats_mixed_attn
+from nats.ops.mixed_ops.mixed_attn_delta import nats_mixed_attn_delta
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -29,14 +27,13 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 
-@torch.compile
 def elu_p1(x):
     return (F.elu(x, 1., False) + 1.).to(x)
 
 
-@torch.compile
 def sum_norm(x):
     return (x / x.sum(-1, keepdim=True)).to(x)
+
 
 from torch.nn.functional import gumbel_softmax
 
@@ -57,9 +54,9 @@ def hard_softmax(
     return ret
 
 
-class NeuralAttentionSearchLinear(nn.Module):
+class NeuralAttentionSearchLinearAttnDelta(nn.Module):
     """
-    The Architecture of this layer is implemented based on the GatedDeltaNet architecture
+    The Architecture of this layer is implemented based on the Delta architecture
 
     Parameter alloation when use_gate=True:
         - 0.75 * hidden_size * hidden_size for the q_proj and k_proj each
@@ -130,10 +127,10 @@ class NeuralAttentionSearchLinear(nn.Module):
             conv_size: int = 4,
             conv_bias: bool = False,
             conv_activation: str | None = 'silu',  # TODO check if None or silu works better?
-            outputs_are_wighted:bool = False,
+            outputs_are_wighted: bool = False,
             attn_qk_norm: bool = False,
             attn_with_short_conv: bool = False,
-            compute_dnats_for_invalid_blocks_attn: bool= False,
+            compute_dnats_for_invalid_blocks_attn: bool = False,
             compute_dnats_for_invalid_blocks_linear_att: bool = False,
             incomplete_block_start_with_ht: bool = True,
             attn_apply_pos_encoding: bool = True,
@@ -142,7 +139,7 @@ class NeuralAttentionSearchLinear(nn.Module):
             layer_idx: int = None,
             norm_eps: float = 1e-5,
             **kwargs
-    ) -> NeuralAttentionSearchLinear:
+    ) -> NeuralAttentionSearchLinearAttnDelta:
         super().__init__()
 
         self.mode = mode
@@ -205,7 +202,6 @@ class NeuralAttentionSearchLinear(nn.Module):
         self.nats_block_agg_type = nats_block_agg_type
         self.ops_for_incomplete_chunks = ops_for_incomplete_chunks
 
-
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
             raise ValueError(
@@ -236,7 +232,6 @@ class NeuralAttentionSearchLinear(nn.Module):
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
 
         if nats_block_agg_type == 'mean':
@@ -250,25 +245,6 @@ class NeuralAttentionSearchLinear(nn.Module):
         else:
             self.nats_sample_func = partial(hard_softmax, dim=-1)
         self.nats_layer = nn.Linear(hidden_size, (self.n_ops * self.num_nats_head), bias=False)
-
-        A = torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(0, 16)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
-        # hard coded for now
-        dt_min = 0.001
-        dt_max = 0.1
-        dt_init_floor = 1e-4
-        dt = torch.exp(
-            torch.rand(self.num_v_heads) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        )
-        dt = torch.clamp(dt, min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)
-        # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
-        # name.endswith("bias") in param_grouping.py
-        self.dt_bias._no_weight_decay = True
 
         self.outputs_are_wighted = outputs_are_wighted
         if self.outputs_are_wighted:
@@ -311,7 +287,7 @@ class NeuralAttentionSearchLinear(nn.Module):
             self,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[Cache] = None, # TODO write a new cache management!!!
+            past_key_values: Optional[Cache] = None,  # TODO write a new cache management!!!
             use_cache: Optional[bool] = False,
             output_attentions: Optional[bool] = False,
             **kwargs: Unpack[Dict]
@@ -344,10 +320,10 @@ class NeuralAttentionSearchLinear(nn.Module):
         )
         hs_reduced = hs_reduced.view(batch_size, hs_reduced.shape[1], dim)
         nats_op_types = self.nats_layer(hs_reduced)
-        nats_op_logits = rearrange(nats_op_types,  '... (h d) -> ... h d', d=self.n_ops)
+        nats_op_logits = rearrange(nats_op_types, '... (h d) -> ... h d', d=self.n_ops)
         nats_op_types = self.nats_sample_func(nats_op_logits)
         # The last block is set 1 for all the operations. This does not influence the output values
-        nats_op_types[:,-1] = 1
+        nats_op_types[:, -1] = 1
         n_nats_blocks = nats_op_types.int().sum(1)
         self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
 
@@ -381,7 +357,7 @@ class NeuralAttentionSearchLinear(nn.Module):
                 q_attn = self.q_proj(hidden_states)
                 k_attn = self.k_proj(hidden_states)
                 v_attn = self.v_proj(hidden_states)
-                
+
                 q, conv_state_q = self.q_conv1d(
                     x=q_attn,
                     cache=conv_state_q,
@@ -400,13 +376,13 @@ class NeuralAttentionSearchLinear(nn.Module):
                     output_final_state=use_cache,
                     cu_seqlens=cu_seqlens
                 )
-                
+
         else:
             if self.attn_with_short_conv:
                 q = F.silu(self.q_proj(hidden_states))
                 k = F.silu(self.k_proj(hidden_states))
                 v = F.silu(self.v_proj(hidden_states))
-                
+
                 q_attn = q
                 k_attn = k
                 v_attn = v
@@ -414,14 +390,14 @@ class NeuralAttentionSearchLinear(nn.Module):
                 q_attn = self.q_proj(hidden_states)
                 k_attn = self.k_proj(hidden_states)
                 v_attn = self.v_proj(hidden_states)
-                
+
                 q = F.silu(q_attn)
                 k = F.silu(k_attn)
                 v = F.silu(v_attn)
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
-        
+
         q_attn, k_attn = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_attn_k_dim), (q_attn, k_attn))
         v_attn = rearrange(v_attn, '... (h d) -> ... h d', d=self.head_attn_v_dim)
         # TODO grouped QKV for attns...
@@ -455,15 +431,13 @@ class NeuralAttentionSearchLinear(nn.Module):
         if self.allow_neg_eigval:
             beta = beta * 2.
 
-        g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
-
         recurrent_state_gated_delta = last_state['recurrent_state_gated_delta'] if last_state is not None else None
         if mode == 'chunk':
-            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn(
+            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn_delta(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
                 initial_state_gated_delta=recurrent_state_gated_delta,
-                g=g, beta=beta,
+                beta=beta,
                 nats_block_types=nats_op_types,
                 n_nats_blocks=n_nats_blocks,
                 scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
@@ -507,102 +481,3 @@ class NeuralAttentionSearchLinear(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-
-
-def test_mixed_attn():
-    torch.manual_seed(0)
-    device = torch.device('cuda')
-    from nats.utils import check_fp16_dtype
-    from torch.nn import functional as F
-
-    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-
-    layer = NeuralAttentionSearchLinear(hidden_size=512, head_dim=128, num_heads=2, num_attn_heads=4,
-                                        expand_v=1,
-                                        ops_for_incomplete_chunks='attn',
-                                        use_short_conv=False,
-                                        compute_dnats_for_invalid_blocks_linear_att=False,
-                                        compute_dnats_for_invalid_blocks_attn=False
-
-                                        ).cuda()
-    input_data = torch.randn((2, 512, 512)).cuda()
-    out = layer(input_data)[0]
-    label = torch.rand_like(out)
-
-    loss = ((out - label)**2).sum()
-    loss.backward()
-    import pdb
-    pdb.set_trace()
-
-
-    BATCH = 2
-
-    HDELTA = 2
-
-    HATTN = 4
-    HNATS = 2
-
-    T = 512
-    N_OPTs = 2
-    NATS_block_size = 64
-    DATTN = 64
-    DGATED = 128
-    V_EXPAND = 2
-    TNAtS = T // NATS_block_size
-    torch.manual_seed(0)
-    device = torch.device('cuda')
-    from nats.utils import check_fp16_dtype
-    from torch.nn import functional as F
-
-    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-
-    q = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, T, HDELTA * DGATED * V_EXPAND), dtype=dtype, device=device, requires_grad=True)
-    logits = torch.randn(BATCH, TNAtS, HNATS * N_OPTs, device=device, dtype=dtype)
-
-    beta = torch.randn(BATCH, T, HDELTA, dtype=dtype, device=device, requires_grad=True).sigmoid()
-    g0 = F.logsigmoid(torch.rand(BATCH, T, HDELTA, dtype=torch.float32, device=device, requires_grad=True) * 20)
-
-    q = torch.nn.Parameter(q, requires_grad=True)
-    k = torch.nn.Parameter(k, requires_grad=True)
-    v = torch.nn.Parameter(v, requires_grad=True)
-    beta = torch.nn.Parameter(beta, requires_grad=True)
-    g0 = torch.nn.Parameter(g0, requires_grad=True)
-    logits = torch.nn.Parameter(logits, requires_grad=True)
-
-    q_attn = q.view(BATCH, T, HATTN, DATTN)
-    k_attn = k.view(BATCH, T, HATTN, DATTN)
-    v_attn = v.view(BATCH, T, HATTN, DATTN * V_EXPAND)
-
-    q_lattn = q.view(BATCH, T, HDELTA, DGATED)
-    k_lattn = k.view(BATCH, T, HDELTA, DGATED)
-    v_lattn = v.view(BATCH, T, HDELTA, DGATED * V_EXPAND)
-
-    logits_ = logits.view(BATCH, TNAtS, HNATS, N_OPTs)
-    nats_block_types = torch.nn.functional.gumbel_softmax(logits_, dim=-1, hard=True)
-    n_nats_blocks = nats_block_types.int().sum(1)
-
-    out, _ = nats_mixed_attn(
-        q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
-        q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
-        initial_state_gated_delta=None,
-        g=g0, beta=beta, nats_block_types=nats_block_types, n_nats_blocks=n_nats_blocks,
-        scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
-        cu_seqlens=None, cu_seqlens_nats=None,
-        nats_block_size=NATS_block_size,
-        ops_for_incomplete_chunks='attn',
-        compute_dnats_for_invalid_blocks_attn=False,
-        compute_dnats_for_invalid_blocks_linear_att=False
-    )
-
-    loss = (out ** 2)
-    loss.sum().backward()
-    import pdb
-    pdb.set_trace()
-
-
-if __name__ == "__main__":
-    # only works on post-Ampere GPUs right now
-    # test_compute_h()
-    test_mixed_attn()

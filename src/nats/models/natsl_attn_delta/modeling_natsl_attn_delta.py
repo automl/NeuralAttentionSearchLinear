@@ -25,8 +25,8 @@ from fla.layers.gated_deltanet import GatedDeltaNet
 from fla.modules import RMSNorm
 from fla.modules.l2warp import l2_warp
 
-from nats.models.natsl.configuration_natsl import NeuralAttentionSearchLineraConfig
-from nats.layers.natsl import NeuralAttentionSearchLinear
+from nats.models.natsl_attn_delta.configuration_natsl_attn_delta import NeuralAttentionSearchLineraAttnDeltaConfig
+from nats.layers.natsl_attn_delta import NeuralAttentionSearchLinearAttnDelta
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -45,8 +45,8 @@ class NAtSCausalLMOutputWithPast(CausalLMOutputWithPast):
     attn_frac: Optional[torch.Tensor] = None
 
 
-class NeuralAttentionSearchLinearBlock(nn.Module):
-    def __init__(self, config: NeuralAttentionSearchLineraConfig, layer_idx: int):
+class NeuralAttentionSearchLinearAttnDeltaBlock(nn.Module):
+    def __init__(self, config: NeuralAttentionSearchLineraAttnDeltaConfig, layer_idx: int):
         super().__init__()
 
         self.config = config
@@ -69,7 +69,7 @@ class NeuralAttentionSearchLinearBlock(nn.Module):
                 layer_idx=layer_idx
             )
         else:
-            self.attn = NeuralAttentionSearchLinear(
+            self.attn = NeuralAttentionSearchLinearAttnDelta(
                 hidden_size=config.hidden_size,
                 expand_v=config.expand_v,
                 head_dim=config.head_dim,
@@ -141,12 +141,12 @@ class NeuralAttentionSearchLinearBlock(nn.Module):
         return outputs
 
 
-class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
+class NeuralAttentionSearchLinearAttnDeltaPreTrainedModel(PreTrainedModel):
 
-    config_class = NeuralAttentionSearchLineraConfig
+    config_class = NeuralAttentionSearchLineraAttnDeltaConfig
     base_model_prefix = 'model'
     supports_gradient_checkpointing = True
-    _no_split_modules = ['NeuralAttentionSearchLinearBlock']
+    _no_split_modules = ['NeuralAttentionSearchLinearAttnDeltaBlock']
     _supports_cache_class = True
 
     def __init__(self, *inputs, **kwargs):
@@ -158,8 +158,7 @@ class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
         prenorm_residual_strategy: Optional[str] = None,
         num_residuals_per_layer: int = 2,
     ):
-        if (isinstance(module, NeuralAttentionSearchLinear) and next(module.parameters()).device.type != 'meta') \
-                or (isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta'):
+        if  (isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta'):
             with torch.no_grad():
                 module.A_log.copy_(nn.init.uniform_(module.A_log, a=0, b=16).log())
                 module.A_log._no_weight_decay = True
@@ -209,15 +208,15 @@ class NeuralAttentionSearchLinearPreTrainedModel(PreTrainedModel):
                     raise ValueError(f"Invalid prenorm_residual_strategy: {prenorm_residual_strategy}")
 
 
-class NeuralAttentionSearchLinearModel(NeuralAttentionSearchLinearPreTrainedModel):
+class NeuralAttentionSearchLinearAttnDeltaModel(NeuralAttentionSearchLinearAttnDeltaPreTrainedModel):
 
-    def __init__(self, config: NeuralAttentionSearchLineraConfig):
+    def __init__(self, config: NeuralAttentionSearchLineraAttnDeltaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([NeuralAttentionSearchLinearBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([NeuralAttentionSearchLinearAttnDeltaBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
@@ -312,13 +311,13 @@ class NeuralAttentionSearchLinearModel(NeuralAttentionSearchLinearPreTrainedMode
         )
 
 
-class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrainedModel, GenerationMixin):
+class NeuralAttentionSearchLinearAttnDeltaForCausalLM(NeuralAttentionSearchLinearAttnDeltaPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = NeuralAttentionSearchLinearModel(config)
+        self.model = NeuralAttentionSearchLinearAttnDeltaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
@@ -449,7 +448,7 @@ class NeuralAttentionSearchLinearForCausalLM(NeuralAttentionSearchLinearPreTrain
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers if isinstance(layer.attn, NeuralAttentionSearchLinear)]))
+        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers if isinstance(layer.attn, NeuralAttentionSearchLinearAttnDelta)]))
 
         if not return_dict:
             output = (logits,) + outputs[1:]
