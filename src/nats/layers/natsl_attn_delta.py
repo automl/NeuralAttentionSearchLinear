@@ -481,3 +481,101 @@ class NeuralAttentionSearchLinearAttnDelta(nn.Module):
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
+
+def test_mixed_attn():
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    from nats.utils import check_fp16_dtype
+    from torch.nn import functional as F
+
+    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+
+    layer = NeuralAttentionSearchLinearAttnDelta(hidden_size=256, head_dim=64, num_heads=2, num_attn_heads=4,
+                                        expand_v=1,
+                                        ops_for_incomplete_chunks='attn',
+                                        use_short_conv=False,
+                                        compute_dnats_for_invalid_blocks_linear_att=False,
+                                        compute_dnats_for_invalid_blocks_attn=False
+
+                                        ).cuda()
+    input_data = torch.randn((2, 512, 256)).cuda()
+    out = layer(input_data)[0]
+    label = torch.rand_like(out)
+
+    loss = ((out - label)**2).sum()
+    loss.backward()
+    import pdb
+    pdb.set_trace()
+
+
+    BATCH = 2
+
+    HDELTA = 2
+
+    HATTN = 4
+    HNATS = 2
+
+    T = 512
+    N_OPTs = 2
+    NATS_block_size = 64
+    DATTN = 64
+    DGATED = 128
+    V_EXPAND = 2
+    TNAtS = T // NATS_block_size
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    from nats.utils import check_fp16_dtype
+    from torch.nn import functional as F
+
+    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+
+    q = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, T, HDELTA * DGATED * V_EXPAND), dtype=dtype, device=device, requires_grad=True)
+    logits = torch.randn(BATCH, TNAtS, HNATS * N_OPTs, device=device, dtype=dtype)
+
+    beta = torch.randn(BATCH, T, HDELTA, dtype=dtype, device=device, requires_grad=True).sigmoid()
+    g0 = F.logsigmoid(torch.rand(BATCH, T, HDELTA, dtype=torch.float32, device=device, requires_grad=True) * 20)
+
+    q = torch.nn.Parameter(q, requires_grad=True)
+    k = torch.nn.Parameter(k, requires_grad=True)
+    v = torch.nn.Parameter(v, requires_grad=True)
+    beta = torch.nn.Parameter(beta, requires_grad=True)
+    g0 = torch.nn.Parameter(g0, requires_grad=True)
+    logits = torch.nn.Parameter(logits, requires_grad=True)
+
+    q_attn = q.view(BATCH, T, HATTN, DATTN)
+    k_attn = k.view(BATCH, T, HATTN, DATTN)
+    v_attn = v.view(BATCH, T, HATTN, DATTN * V_EXPAND)
+
+    q_lattn = q.view(BATCH, T, HDELTA, DGATED)
+    k_lattn = k.view(BATCH, T, HDELTA, DGATED)
+    v_lattn = v.view(BATCH, T, HDELTA, DGATED * V_EXPAND)
+
+    logits_ = logits.view(BATCH, TNAtS, HNATS, N_OPTs)
+    nats_block_types = torch.nn.functional.gumbel_softmax(logits_, dim=-1, hard=True)
+    n_nats_blocks = nats_block_types.int().sum(1)
+
+    out, _ = nats_mixed_attn_gdn(
+        q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+        q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
+        initial_state_gated_delta=None,
+        g=g0, beta=beta, nats_block_types=nats_block_types, n_nats_blocks=n_nats_blocks,
+        scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
+        cu_seqlens=None, cu_seqlens_nats=None,
+        nats_block_size=NATS_block_size,
+        ops_for_incomplete_chunks='attn',
+        compute_dnats_for_invalid_blocks_attn=False,
+        compute_dnats_for_invalid_blocks_linear_att=False
+    )
+
+    loss = (out ** 2)
+    loss.sum().backward()
+    import pdb
+    pdb.set_trace()
+
+
+if __name__ == "__main__":
+    # only works on post-Ampere GPUs right now
+    # test_compute_h()
+    test_mixed_attn()

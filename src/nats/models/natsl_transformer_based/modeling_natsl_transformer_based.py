@@ -27,7 +27,7 @@ from fla.modules.l2warp import l2_warp
 from nats.models.natsl_transformer_based.configuration_natsl_transformer_based import (
     NeuralAttentionSearchLinearTransformerBasedConfig
 )
-from nats.layers.natsl_transformer_based import NeuralAttentionSearchLinearAttentionBased
+from nats.layers.natsl_attn_gdn_transformer_based import NeuralAttentionSearchLinearAttentionBased
 
 try:
     from torch.distributed.tensor import DTensor
