@@ -431,12 +431,12 @@ class NeuralAttentionSearchLinearAttnDelta(nn.Module):
         if self.allow_neg_eigval:
             beta = beta * 2.
 
-        recurrent_state_gated_delta = last_state['recurrent_state_gated_delta'] if last_state is not None else None
+        recurrent_state_delta = last_state['recurrent_state_delta'] if last_state is not None else None
         if mode == 'chunk':
-            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn_delta(
+            o_gated_delta, o_attn, recurrent_state_delta = nats_mixed_attn_delta(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
-                initial_state_gated_delta=recurrent_state_gated_delta,
+                initial_state_delta=recurrent_state_delta,
                 beta=beta,
                 nats_block_types=nats_op_types,
                 n_nats_blocks=n_nats_blocks,
@@ -464,7 +464,7 @@ class NeuralAttentionSearchLinearAttnDelta(nn.Module):
         if past_key_values is not None:
             # TODO this needs to be updated!!!
             past_key_values.update(
-                recurrent_state=recurrent_state_gated_delta,
+                recurrent_state=recurrent_state_delta,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
                 offset=q_len
