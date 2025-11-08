@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
+import copy
 from typing import Optional, Tuple
 
 import torch
@@ -9,6 +9,10 @@ import triton.language as tl
 
 from fla.ops.utils.op import exp
 from fla.utils import input_guard
+
+@triton.jit
+def exp(x):
+    return tl.exp(x)
 
 
 @triton.heuristics({
@@ -110,7 +114,7 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
 
     p_hcur = hcur + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
 
-    b_hcur = tl.load(p_hcur, mask=mask_v, other=0).to(tl.float32)
+    b_hcur = tl.load(p_hcur, mask=mask_h, other=0).to(tl.float32)
 
     nats_block_types += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
 
@@ -118,11 +122,13 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
 
     n_iter1 = min(T, NATS_BLOCK_SIZE - b_ntokens_in_current_block)
 
+
     # the first iteration
     for _ in range(0, n_iter1):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
             b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
@@ -144,12 +150,12 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         if USE_GV:
             b_gv = tl.load(p_gv).to(tl.float32)
             b_h *= exp(b_gv[None, :])
-
         b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
         b_h += b_k[:, None] * b_v
 
         # [BV]
         b_o = tl.sum(b_h * b_q[:, None], 0)
+
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H*K
@@ -170,7 +176,6 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         is_delta = tl.load(nats_block_types)
         b_h = tl.where(is_delta, b_h, b_hcur)
         b_hcur = b_h
-
     # Now we want to continue the following
     for _ in range(0, TNAtS - 2):
         for _ in range(0, NATS_BLOCK_SIZE):
@@ -223,7 +228,8 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         b_hcur = b_h
 
     # the last block
-    n_iters_last = T - b_ntokens_in_current_block - (TNAtS - 2) * NATS_BLOCK_SIZE
+    n_iters_last = T - n_iter1 - max(TNAtS - 2, 0) * NATS_BLOCK_SIZE
+
     for _ in range(0, n_iters_last):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -272,6 +278,7 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     # we only store the temporal hidden state if we arrive the new hidden state and the new block is a delta block
     nats_block_types += N_TYPES * HNAtS
     is_delta = tl.load(nats_block_types)
+
     if n_iters_last == NATS_BLOCK_SIZE:
         b_h = tl.where(is_delta, b_h, b_hcur)
         b_hcur = b_h
@@ -293,7 +300,7 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     gv: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
     nats_block_types: Optional[torch.Tensor] = None,
-    n_tokens_in_current_block: Optional[torch.Tensor] = 0,
+    n_tokens_in_current_block: Optional[torch.Tensor | int] = 0,
     nats_block_size: int=64,
     scale: float = None,
     offset_op: int = 1,
@@ -303,7 +310,7 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_nats: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     B, TNAtS, HNAtS, N_TYPES = nats_block_types.shape
     HV = v.shape[2]
@@ -321,6 +328,12 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
             initial_state_in_current_block = initial_state.clone()
         else:
             initial_state_in_current_block = q.new_zeros(N, HV, K, V, dtype=torch.float32)
+
+    if isinstance(n_tokens_in_current_block, int):
+        n_tokens_in_current_block = torch.full(
+            [N], fill_value=n_tokens_in_current_block, device=v.device, dtype=torch.int32
+        )
+    assert len(n_tokens_in_current_block) == B
 
     grid = (NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_nats_kernel[grid](
@@ -544,3 +557,119 @@ def fused_recurrent_gated_delta_rule(
         cu_seqlens_nats,
     )
     return o, final_state, initial_state_in_current_block
+
+
+def test_recurrent_fwd():
+    torch.manual_seed(0)
+    from nats.utils import check_fp16_dtype
+    import triton
+    from torch.nn import functional as F
+    import math
+    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    dtype = torch.float16
+
+    n_data_in_ctx = 63
+
+    B = 2
+    H = 4
+    HNatS = 4
+    T = 1
+    N_TYPES = 3
+    GNAtS = H // HNatS
+    delta_offset = 1
+    K = 128
+    V = 256
+    NATS_Chunk = 64
+    DELTA_IDX = 1
+
+    T_NAtS = triton.cdiv(T + n_data_in_ctx, NATS_Chunk)
+
+    device = torch.device('cuda')
+    q = torch.randn(B, T, H, K, dtype=dtype, device=torch.device('cuda'))
+    k = F.normalize(torch.randn(B, T, H, K, dtype=dtype, device='cuda'), p=2, dim=-1)
+    v = torch.randn(B, T, H, V, dtype=dtype, device=torch.device('cuda'))
+    beta = torch.randn(B, T, H, dtype=dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device) * 20)
+
+    h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=torch.device('cuda'))
+    h0_chunk_start = torch.randn(B, H, K, V, dtype=torch.float32, device=torch.device('cuda'))
+
+    logits = torch.randn(B, T_NAtS, HNatS, N_TYPES, device=torch.device('cuda'), dtype=dtype)
+    nats_block_types = torch.nn.functional.gumbel_softmax(logits, dim=-1, hard=True)
+
+    scale = 1 / math.sqrt(K)
+    t_current = 0
+    all_output = []
+    state_tmp = copy.deepcopy(h0)
+    state_chunk_start = copy.deepcopy(h0_chunk_start)
+    for i_chunk in range(T_NAtS):
+        if i_chunk == 0:
+            t_end = NATS_Chunk - n_data_in_ctx
+            q_in = q[:, t_current:t_end, ]
+            k_in = k[:, t_current:t_end ]
+            v_in = v[:, t_current:t_end]
+            beta_in = beta[:, t_current:t_end]
+            g_in = g[:, t_current:t_end]
+            t_current = t_end
+        else:
+            t_end = min(t_current + NATS_Chunk, T)
+            q_in = q[:, t_current:t_end, ]
+            k_in = k[:, t_current:t_end ]
+            v_in = v[:, t_current:t_end]
+            beta_in = beta[:, t_current:t_end]
+            g_in = g[:, t_current:t_end]
+            t_current = t_end
+
+        o1, final_state1 = fused_recurrent_gated_delta_rule_fwd(
+            q=q_in.contiguous(), k=k_in.contiguous(), v=v_in.contiguous(), g=g_in.contiguous(),
+            beta=beta_in.contiguous(), scale=scale, initial_state=state_tmp,
+            output_final_state=True, use_qk_l2norm_in_kernel=True
+        )
+        all_output.append(o1)
+        #if not ((i_chunk == T_NAtS - 1) and (k_in.shape[1] < NATS_Chunk)):
+        if True: # TODO for test purpose, this might need to be further optimized...
+            for b in range(B):
+                for h in range(H):
+                    block_is_delta = nats_block_types[b, i_chunk, h, DELTA_IDX]
+                    if block_is_delta:
+                        state_chunk_start[b, h] = final_state1[b,h]
+                    state_tmp[b,h] = state_chunk_start[b,h]
+
+    o1 = torch.cat(all_output, dim=1)
+    final_state_chunkstart1 = state_chunk_start
+
+    o, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule_nats_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        gk=None,
+        gv=None,
+        beta=beta,
+        nats_block_types=nats_block_types,
+        n_tokens_in_current_block=n_data_in_ctx,
+        nats_block_size=NATS_Chunk,
+        scale=scale,
+        initial_state=copy.deepcopy(h0),
+        initial_state_in_current_block=copy.deepcopy(h0_chunk_start),
+        offset_op=DELTA_IDX,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=None,
+        cu_seqlens_nats=None,
+    )
+    print(f"diff o: {(o-o1).abs().max()}")
+    print(f"diff states: {(final_state1-final_state).abs().max()}")
+    print(f"diff state_chunk: {(final_state_chunkstart1-initial_state_in_current_block).abs().max()}")
+
+
+    import pdb
+    pdb.set_trace()
+
+
+if __name__ == "__main__":
+    # only works on post-Ampere GPUs right now
+    # test_compute_h()
+    test_recurrent_fwd()
+
