@@ -20,19 +20,13 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
-from fla.modules import GatedMLP as TransformerMLP
+from fla.modules import GatedMLP as GatedDeltaNetMLP
+from fla.layers.gated_deltanet import GatedDeltaNet
 from fla.modules import RMSNorm
 from fla.modules.l2warp import l2_warp
 
-from nats.models.natsl_transformer_based.configuration_natsl_transformer_based import (
-    NeuralAttentionSearchLinearTransformerBasedConfig
-)
-from nats.layers.natsl_attn_gdn_transformer_based import NeuralAttentionSearchLinearAttentionBased
-
-try:
-    from torch.distributed.tensor import DTensor
-except (ImportError, AttributeError):
-    DTensor = None
+from nats.models.natsl_attn_gdn.configuration_natsl_attn_gdn import NeuralAttentionSearchLineraAttnGDNConfig
+from nats.layers.natsl_attn_gdn import NeuralAttentionSearchLinearAttnGDN
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -51,42 +45,62 @@ class NAtSCausalLMOutputWithPast(CausalLMOutputWithPast):
     attn_frac: Optional[torch.Tensor] = None
 
 
-class NeuralAttentionSearchLinearBlock(nn.Module):
-    def __init__(self, config: NeuralAttentionSearchLinearTransformerBasedConfig, layer_idx: int):
+class NeuralAttentionSearchLinearAttnGDNBlock(nn.Module):
+    def __init__(self, config: NeuralAttentionSearchLineraAttnGDNConfig, layer_idx: int):
         super().__init__()
 
         self.config = config
         self.layer_idx = layer_idx
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.attn = NeuralAttentionSearchLinearAttentionBased(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_heads,
-            num_lattn_heads=config.num_lattn_heads,
-            num_kv_heads=config.num_kv_heads,
-            num_nats_head=config.num_kv_heads,
-            qkv_bias=config.qkv_bias,
-            qk_norm=config.qk_norm,
-            window_size=config.window_size,
-            n_ops=config.n_ops,
-            nats_block_size=config.nats_block_size,
-            nats_block_agg_type=config.nats_block_agg_type,
-            nats_sample_strategy=config.nats_sample_strategy,
-            ops_for_incomplete_chunks=config.ops_for_incomplete_chunks,
-            mode=config.mode,
-            allow_neg_eigval=config.allow_neg_eigval,
-            lattns_use_silu=config.lattns_use_silu,
-            outputs_are_wighted=config.outputs_are_wighted,
-            compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
-            compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_linear_att,
-            incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
-            attn_apply_pos_encoding=config.attn_apply_pos_encoding,
-            rope_theta=config.rope_theta,
-            max_position_embeddings=config.max_position_embeddings,
-            layer_idx=layer_idx,
-        )
+        if layer_idx in config.gdn_layers:
+            self.attn = GatedDeltaNet(
+                mode=config.attn_mode,
+                hidden_size=config.hidden_size,
+                expand_v=config.expand_v,
+                head_dim=config.head_dim,
+                num_heads=config.num_heads,
+                num_v_heads=config.num_v_heads,
+                use_gate=config.use_gate,
+                use_short_conv=config.use_short_conv,
+                allow_neg_eigval=config.allow_neg_eigval,
+                conv_size=config.conv_size,
+                norm_eps=config.norm_eps,
+                layer_idx=layer_idx
+            )
+        else:
+            self.attn = NeuralAttentionSearchLinearAttnGDN(
+                hidden_size=config.hidden_size,
+                expand_v=config.expand_v,
+                head_dim=config.head_dim,
+                num_heads=config.num_heads,
+                num_attn_heads=config.num_attn_heads,
+                num_v_heads=config.num_v_heads,
+                n_ops=config.n_ops,
+                num_nats_head=config.num_nats_head,
+                nats_block_size=config.nats_block_size,
+                nats_block_agg_type=config.nats_block_agg_type,
+                nats_sample_strategy=config.nats_sample_strategy,
+                ops_for_incomplete_chunks=config.ops_for_incomplete_chunks,
+                use_gate=config.use_gate,
+                use_short_conv=config.use_short_conv,
+                allow_neg_eigval=config.allow_neg_eigval,
+                conv_size=config.conv_size,
+                conv_bias=config.conv_bias,
+                outputs_are_wighted=config.outputs_are_wighted,
+                attn_qk_norm=config.attn_qk_norm,
+                attn_with_short_conv=config.attn_with_short_conv,
+                compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
+                compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_attn,
+                incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
+                attn_rope_theta=config.attn_rope_theta,
+                attn_apply_pos_encoding=config.attn_apply_pos_encoding,
+                attn_max_position_embeddings=config.attn_max_position_embeddings,
+                norm_eps=config.norm_eps,
+                layer_idx=layer_idx,
+            )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.mlp = TransformerMLP(
+        self.mlp = GatedDeltaNetMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
@@ -122,23 +136,17 @@ class NeuralAttentionSearchLinearBlock(nn.Module):
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (attentions,)
-
-        if use_cache:
-            outputs += (past_key_values,)
+        outputs = (hidden_states, attentions, past_key_values)
 
         return outputs
 
 
-class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel):
+class NeuralAttentionSearchLinearAttnGDNPreTrainedModel(PreTrainedModel):
 
-    config_class = NeuralAttentionSearchLinearTransformerBasedConfig
+    config_class = NeuralAttentionSearchLineraAttnGDNConfig
     base_model_prefix = 'model'
     supports_gradient_checkpointing = True
-    _no_split_modules = ['NeuralAttentionSearchLinearAttentionBased']
+    _no_split_modules = ['NeuralAttentionSearchLinearAttnGDNBlock']
     _supports_cache_class = True
 
     def __init__(self, *inputs, **kwargs):
@@ -150,38 +158,19 @@ class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel
         prenorm_residual_strategy: Optional[str] = None,
         num_residuals_per_layer: int = 2,
     ):
-        if isinstance(module, NeuralAttentionSearchLinearAttentionBased):
-
-            # --- A_log ---
-            A = torch.empty(module.num_lattn_heads, dtype=torch.float32).uniform_(0, 16)
+        if (isinstance(module, NeuralAttentionSearchLinearAttnGDN) and next(module.parameters()).device.type != 'meta') \
+                or (isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta'):
+            # TODO check the case if we init them to 0!
             with torch.no_grad():
-                if not isinstance(module.A_log, DTensor):
-                    module.A_log.copy_(torch.log(A))
-                else:
-                    logger.warning_once("`A_log` is a DTensor, skipping initialization")
-            module.A_log._no_weight_decay = True
-
-            # --- dt_bias ---
-            # hard coded for now
-            dt_min = 0.001
-            dt_max = 0.1
-            dt_init_floor = 1e-4
-            dt = torch.exp(
-                torch.rand(module.num_lattn_heads) * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            )
-            dt = torch.clamp(dt, min=dt_init_floor)
-            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
-            with torch.no_grad():
-                if not isinstance(module.dt_bias, DTensor):
-                    module.dt_bias.copy_(inv_dt)
-                else:
-                    logger.warning_once("`dt_bias` is a DTensor, skipping initialization")
-            # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            module.dt_bias._no_weight_decay = True
-            module.dt_bias._no_reinit = True
+                module.A_log.copy_(nn.init.uniform_(module.A_log, a=0, b=16).log())
+                module.A_log._no_weight_decay = True
+                dt = torch.exp(
+                    nn.init.uniform_(module.dt_bias) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+                ).clamp(min=1e-4)
+                # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+                module.dt_bias.copy_(inv_dt)
+                module.dt_bias._no_weight_decay = True
 
         elif isinstance(module, (nn.Linear, nn.Conv1d)):
             # Slightly different from the TF version which uses truncated_normal for initialization
@@ -221,15 +210,15 @@ class NeuralAttentionSearchLinearTransformerBasedPreTrainedModel(PreTrainedModel
                     raise ValueError(f"Invalid prenorm_residual_strategy: {prenorm_residual_strategy}")
 
 
-class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLinearTransformerBasedPreTrainedModel):
+class NeuralAttentionSearchLinearAttnGDNModel(NeuralAttentionSearchLinearAttnGDNPreTrainedModel):
 
-    def __init__(self, config: NeuralAttentionSearchLinearTransformerBasedConfig):
+    def __init__(self, config: NeuralAttentionSearchLineraAttnGDNConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([NeuralAttentionSearchLinearBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([NeuralAttentionSearchLinearAttnGDNBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
@@ -281,14 +270,12 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
 
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
-        next_cache = None
-
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                hidden_states, attentions, past_key_values = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     attention_mask,
@@ -298,7 +285,7 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
                     **kwargs
                 )
             else:
-                layer_outputs = layer(
+                hidden_states, attentions, past_key_values = layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
@@ -306,13 +293,9 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
                     output_attentions=output_attentions,
                     **kwargs
                 )
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
-                all_attns += (layer_outputs[1],)
+                all_attns += (attentions,)
 
         hidden_states = self.norm(hidden_states)
 
@@ -321,22 +304,22 @@ class NeuralAttentionSearchLinearTransformerBasedModel(NeuralAttentionSearchLine
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(i for i in [hidden_states, next_cache, all_hidden_states, all_attns] if i is not None)
+            return tuple(i for i in [hidden_states, past_key_values, all_hidden_states, all_attns] if i is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attns
         )
 
 
-class NeuralAttentionSearchLinearTransformerBasedForCausalLM(NeuralAttentionSearchLinearTransformerBasedPreTrainedModel, GenerationMixin):
+class NeuralAttentionSearchLinearAttnGDNForCausalLM(NeuralAttentionSearchLinearAttnGDNPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = NeuralAttentionSearchLinearTransformerBasedModel(config)
+        self.model = NeuralAttentionSearchLinearAttnGDNModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
@@ -467,7 +450,7 @@ class NeuralAttentionSearchLinearTransformerBasedForCausalLM(NeuralAttentionSear
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers]))
+        all_attn_fraction = torch.mean(torch.cat([layer.attn.attn_fraction for layer in self.model.layers if isinstance(layer.attn, NeuralAttentionSearchLinearAttnGDN)]))
 
         if not return_dict:
             output = (logits,) + outputs[1:]

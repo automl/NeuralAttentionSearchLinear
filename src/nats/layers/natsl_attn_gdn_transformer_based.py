@@ -19,7 +19,7 @@ from fla.modules import RMSNorm, RotaryEmbedding
 from fla.ops.utils.index import prepare_lens_from_mask
 from fla.ops.utils.pooling import mean_pooling
 
-from nats.ops.mixed_ops.mixed_attn import nats_mixed_attn
+from nats.ops.mixed_ops.mixed_attn_gdn import nats_mixed_attn_gdn
 
 
 @torch.compile

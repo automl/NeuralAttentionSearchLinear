@@ -5,8 +5,8 @@ from typing import Dict, Optional
 from transformers.configuration_utils import PretrainedConfig
 
 
-class NeuralAttentionSearchLineraConfig(PretrainedConfig):
-    model_type = 'neural_attention_search_linear'
+class NeuralAttentionSearchLineraAttnGDNConfig(PretrainedConfig):
+    model_type = 'neural_attention_search_linear_attn_gdn'
     keys_to_ignore_at_inference = ['past_key_values']
 
     def __init__(

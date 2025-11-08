@@ -21,7 +21,7 @@ from fla.ops.utils.pooling import mean_pooling
 # from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 #from nats.ops.attns.attns import parallel_mixed_attn
 #from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
-from nats.ops.mixed_ops.mixed_attn import nats_mixed_attn
+from nats.ops.mixed_ops.mixed_attn_gdn import nats_mixed_attn_gdn
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -57,7 +57,7 @@ def hard_softmax(
     return ret
 
 
-class NeuralAttentionSearchLinear(nn.Module):
+class NeuralAttentionSearchLinearAttnGDN(nn.Module):
     """
     The Architecture of this layer is implemented based on the GatedDeltaNet architecture
 
@@ -142,7 +142,7 @@ class NeuralAttentionSearchLinear(nn.Module):
             layer_idx: int = None,
             norm_eps: float = 1e-5,
             **kwargs
-    ) -> NeuralAttentionSearchLinear:
+    ) -> NeuralAttentionSearchLinearAttnGDN:
         super().__init__()
 
         self.mode = mode
@@ -459,7 +459,7 @@ class NeuralAttentionSearchLinear(nn.Module):
 
         recurrent_state_gated_delta = last_state['recurrent_state_gated_delta'] if last_state is not None else None
         if mode == 'chunk':
-            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn(
+            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn_gdn(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
                 initial_state_gated_delta=recurrent_state_gated_delta,
@@ -583,7 +583,7 @@ def test_mixed_attn():
     nats_block_types = torch.nn.functional.gumbel_softmax(logits_, dim=-1, hard=True)
     n_nats_blocks = nats_block_types.int().sum(1)
 
-    out, _ = nats_mixed_attn(
+    out, _ = nats_mixed_attn_gdn(
         q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
         q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
         initial_state_gated_delta=None,

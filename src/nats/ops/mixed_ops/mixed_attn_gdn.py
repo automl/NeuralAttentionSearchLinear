@@ -33,7 +33,7 @@ all_incomplete_ops: dict[str, RunIncompleteBlock] = {
 
 
 @torch.compile
-class NAtSMixedAttention(torch.autograd.Function):
+class NAtSMixedAttentionGDN(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_fwd
@@ -250,7 +250,7 @@ class NAtSMixedAttention(torch.autograd.Function):
                None, None, None, None, None, None, None, None
 
 
-def nats_mixed_attn(
+def nats_mixed_attn_gdn(
         q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
         q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
         initial_state_gated_delta: torch.Tensor,
@@ -274,7 +274,7 @@ def nats_mixed_attn(
     if scale_lattn is None:
         scale_lattn = k_lattn.shape[-1] ** -0.5
 
-    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttention.apply(
+    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttentionGDN.apply(
         q_attn, k_attn, v_attn, q_lattn, k_lattn, v_lattn,
         initial_state_gated_delta, g, beta,
         nats_block_types, n_nats_blocks, scale_attn,
