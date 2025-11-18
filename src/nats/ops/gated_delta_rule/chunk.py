@@ -180,7 +180,7 @@ def chunk_gated_delta_rule_nats_bwd(
         keep_wu_as_kv: bool = True,
         chunk_size: int = 64,
 ):
-    assert keep_wu_as_kv == compute_incomplete_chunk_scores or compute_dnats_for_invalid_blocks
+    assert keep_wu_as_kv == (compute_incomplete_chunk_scores or compute_dnats_for_invalid_blocks)
     w, u = recompute_w_u_nats_fwd(
         k=k,
         v=v,
@@ -258,7 +258,7 @@ def chunk_gated_delta_rule_nats_bwd(
         nats_block_size=nats_block_size,
         offset_delta=offset_delta,
         compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
-        compute_dnats_for_invalid_blocks=compute_dnats_for_invalid_blocks,
+        keep_wu_as_kv=keep_wu_as_kv,
     )
 
     dq, dk, dw, dg, d_nats = chunk_bwd_nats_dqkwg(
@@ -290,6 +290,7 @@ def chunk_gated_delta_rule_nats_bwd(
         chunk_indices_delta_nats=chunk_indices_delta_nats,
         nats_block_size=nats_block_size,
         offset_delta=offset_delta,
+        compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
         keep_wu_as_kv=keep_wu_as_kv,
     )
     dk.add_(dk2)

@@ -747,7 +747,7 @@ def chunk_gated_delta_rule_nats_bwd_dhu(
     nats_block_size: int = 64,
     offset_delta: int = 1,
     compute_incomplete_chunk_scores: bool = False,
-    compute_dnats_for_invalid_blocks: bool = True,
+    keep_wu_as_kv: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -771,6 +771,8 @@ def chunk_gated_delta_rule_nats_bwd_dhu(
     #dv2 = torch.empty_like(dv)
     if compute_incomplete_chunk_scores:
         dv2 = dv.clone()
+    elif keep_wu_as_kv:
+        dv2 = torch.zeros_like(w)
     else:
         dv2 = torch.empty(len(chunk_indices_delta_nats) * BT, GNAtS, V, device=do.device, dtype=do.dtype)
     #def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
@@ -807,7 +809,7 @@ def chunk_gated_delta_rule_nats_bwd_dhu(
         NAtS_BLOCK_SIZE=nats_block_size,
         N_TYPES=n_opts,
         OFFSET_DELTA=offset_delta,
-        WV_ARE_FLATTENED= not (compute_incomplete_chunk_scores or compute_dnats_for_invalid_blocks),
+        WV_ARE_FLATTENED= not keep_wu_as_kv,
         COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
     )
     return dh, dh0, dv2

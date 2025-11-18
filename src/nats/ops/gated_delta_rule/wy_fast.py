@@ -198,7 +198,8 @@ def prepare_wy_repr_bwd_nats_kernel(
         N_TYPES: tl.constexpr,
         OFFSET_DELTA: tl.constexpr,
         IS_VARLEN: tl.constexpr,
-        N_CHUNK_PER_NAtS_BLOCK: tl.constexpr
+        N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
+        KEEP_WU_AS_KV: tl.constexpr,
 ):
     # i_t, i_bh = tl.program_id(0), tl.program_id(1)
     # i_b, i_h = i_bh // H, i_bh % H
@@ -232,22 +233,39 @@ def prepare_wy_repr_bwd_nats_kernel(
     nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_DELTA
     stride_block_types_t = N_TYPES * HNAtS
 
-    A += i_t_.to(tl.int64) * BT * GNAtS * BT + i_gnats * BT
-    dw += (i_t_ * BT * GNAtS + i_gnats).to(tl.int64) * K
-    du += (i_t_ * BT * GNAtS + i_gnats).to(tl.int64) * V + i_gnats * V
-
-    stride_wt = GNAtS * K
-    stride_ut = GNAtS * V
-
     load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
     b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
     i_t0 = b_o_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
+    
+    if KEEP_WU_AS_KV:
+        dw += (bos * H + i_h).to(tl.int64) * K
+        du += (bos * H + i_h).to(tl.int64) * V
+        A += (bos*H + i_h).to(tl.int64) * BT
+
+        stride_wt = H * K
+        stride_ut = H * V
+        p_A = tl.make_block_ptr(A,  (BT, T), (1, H*BT), (0, i_t0), (BT, BT), (0, 1))
+
+        wu_load_shape0 = T
+        wu_load_offset = i_t0
+        
+    else:
+        dw += (i_t_ * BT * GNAtS + i_gnats).to(tl.int64) * K
+        du += (i_t_ * BT * GNAtS + i_gnats).to(tl.int64) * V + i_gnats * V
+        A += i_t_.to(tl.int64) * BT * GNAtS * BT + i_gnats * BT
+
+        stride_wt = GNAtS * K
+        stride_ut = GNAtS * V
+        p_A = tl.make_block_ptr(A,  (BT, T - i_t0), (1, GNAtS * BT), (0, 0), (BT, BT), (0, 1))
+        
+        wu_load_shape0 = T - i_t0
+        wu_load_offset = 0
+        
 
     p_beta = tl.make_block_ptr(beta + (bos * H + i_h), (T,), (H,), (i_t0,), (BT,), (0,))
     p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t0,), (BT,), (0,))
     # p_A = tl.make_block_ptr(A + (bos*H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
 
-    p_A = tl.make_block_ptr(A,  (BT, T - i_t0), (1, GNAtS * BT), (0, 0), (BT, BT), (0, 1))
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     b_beta = tl.load(p_beta, boundary_check=(0,))
@@ -261,7 +279,7 @@ def prepare_wy_repr_bwd_nats_kernel(
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t0, i_k * BK), (BT, BK), (1, 0))
         p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t0, i_k * BK), (BT, BK), (1, 0))
-        p_dw = tl.make_block_ptr(dw, (T - i_t0, K), (stride_wt, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_dw = tl.make_block_ptr(dw, (wu_load_shape0, K), (stride_wt, 1), (wu_load_offset, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_k_beta_g = (b_k * b_beta[:, None] * b_g_exp[:, None]).to(b_k.dtype)
         b_dw = tl.load(p_dw, boundary_check=(0, 1))
@@ -275,7 +293,7 @@ def prepare_wy_repr_bwd_nats_kernel(
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
         p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
-        p_du = tl.make_block_ptr(du, (T - i_t0, V), (stride_ut, 1), (0, i_v * BV), (BT, BV), (1, 0))
+        p_du = tl.make_block_ptr(du, (wu_load_shape0, V), (stride_ut, 1), (wu_load_offset, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_v_beta = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_du = tl.load(p_du, boundary_check=(0, 1))
@@ -284,7 +302,6 @@ def prepare_wy_repr_bwd_nats_kernel(
         b_dv = b_dv_beta * b_beta[:, None]
         b_dbeta += tl.sum(b_dv_beta * b_v, 1)
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -439,7 +456,6 @@ def recompute_w_u_nats_fwd(
     )
     return w, u
 
-
 def prepare_wy_repr_nats_bwd(
         k: torch.Tensor,
         v: torch.Tensor,
@@ -456,9 +472,12 @@ def prepare_wy_repr_nats_bwd(
         cu_seqlens_nats:  Optional[torch.LongTensor]=None,
         nats_block_size:int=64,
         offset_delta:int=1,
+        compute_incomplete_chunk_scores:bool=True,
         keep_wu_as_kv: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if keep_wu_as_kv:
+    # if we do not compute incomplete chunk scores, then there is no grad for
+    # dk, dv, dbeta, dg for invalid blocks
+    if compute_incomplete_chunk_scores:
         return prepare_wy_repr_bwd(k, v, g, beta, A, dw, du, cu_seqlens)
 
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -512,6 +531,7 @@ def prepare_wy_repr_nats_bwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        KEEP_WU_AS_KV=keep_wu_as_kv,
     )
     return dk, dv, dbeta, dg
 

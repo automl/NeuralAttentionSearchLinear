@@ -56,12 +56,18 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
                 lattn_use_qk_l2norm_in_kernel: bool = True,
                 ):
         incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
-
+        """
+        # TODO check how to check if this function is forwarded under no_grad env!
         if not incomplete_block_strategy.gated_delta_net:
             if torch.is_grad_enabled():
                 keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
             else:
                 keep_wu_as_kv = False
+        else:
+            keep_wu_as_kv = True
+        """
+        if not incomplete_block_strategy.gated_delta_net:
+            keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
         else:
             keep_wu_as_kv = True
 
@@ -341,7 +347,7 @@ def test_mixed_attn():
     nats_block_types[:,-1] = 1
     n_nats_blocks = nats_block_types.int().sum(1)
 
-    out, _ = nats_mixed_attn(
+    o_gated_delta_net,  o_attn, gated_delta_ht = nats_mixed_attn_gdn(
         q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
         q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
         initial_state_gated_delta=None,
@@ -349,12 +355,12 @@ def test_mixed_attn():
         scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size=NATS_block_size,
-        ops_for_incomplete_chunks='all',
+        ops_for_incomplete_chunks='attn',
         compute_dnats_for_invalid_blocks_attn=False,
-        compute_dnats_for_invalid_blocks_linear_att=False
+        compute_dnats_for_invalid_blocks_linear_att=True
     )
 
-    loss = (out ** 2)
+    loss = (o_gated_delta_net ** 2) + o_attn.view(o_gated_delta_net.shape) ** 2
     loss.sum().backward()
     import pdb
     pdb.set_trace()
