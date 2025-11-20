@@ -11,6 +11,7 @@ from nats.ops.common.chunk_delta_h import chunk_gated_delta_rule_nats_bwd_dhu, c
 from nats.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_nats_fwd
 from nats.ops.gated_delta_rule.wy_fast import prepare_wy_repr_nats_bwd, prepare_wy_repr_nats_fwd, recompute_w_u_nats_fwd
 from nats.ops.common.chunk_o import chunk_bwd_nats_dqkwg, chunk_bwd_dv_qdo_nats_local, chunk_fwd_nats_o
+from nats.ops.utils.cumsum import chunk_cumsum_non_gated_chunks
 from fla.ops.utils import chunk_local_cumsum
 from nats.ops.utils import solve_tril_nats
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -37,6 +38,7 @@ def chunk_gated_delta_rule_nats_fwd(
         chunk_indices_delta_nats: torch.Tensor,
         nats_block_delta_offsets: torch.Tensor,
         starting_h_idx_delta: torch.Tensor,
+        decay_for_non_gdn_blocks: bool= True,
         cu_seqlens: Optional[torch.LongTensor] = None,
         cu_seqlens_nats: Optional[torch.LongTensor] = None,
         nats_block_size: int = 64,
@@ -54,6 +56,20 @@ def chunk_gated_delta_rule_nats_fwd(
     g = chunk_local_cumsum(g, chunk_size=64,
                            cu_seqlens=cu_seqlens,
                            )
+    if decay_for_non_gdn_blocks:
+        g = chunk_cumsum_non_gated_chunks(
+            g_cumsum=g,
+            chunk_size=chunk_size,
+            nats_block_size=nats_block_size,
+            nats_block_types=nats_block_types,
+            nats_block_indices=nats_block_indices,
+            chunk_indices_op_nats=chunk_indices_delta_nats,
+            reversed=False,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            offset_op=offset_delta,
+        )
+
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_nats_fwd(
         k=k,
@@ -125,6 +141,7 @@ def chunk_gated_delta_rule_nats_fwd(
         compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
         incomplete_block_start_with_ht=incomplete_block_start_with_ht,
         keep_wu_as_kv=keep_wu_as_kv,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
     )
     o = chunk_fwd_nats_o(
         q=q,
@@ -148,6 +165,7 @@ def chunk_gated_delta_rule_nats_fwd(
         offset_op=offset_delta,
         compute_incomplete_block_scores=compute_incomplete_chunk_scores,
         incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
         keep_wu_as_kv=keep_wu_as_kv,
     )
     return g, o, A, final_state
@@ -178,6 +196,7 @@ def chunk_gated_delta_rule_nats_bwd(
         compute_dnats_for_invalid_blocks: bool = True,
         incomplete_block_start_with_ht: bool = True,
         keep_wu_as_kv: bool = True,
+        decay_for_non_gdn_blocks:bool=False,
         chunk_size: int = 64,
 ):
     assert keep_wu_as_kv == (compute_incomplete_chunk_scores or compute_dnats_for_invalid_blocks)
@@ -218,6 +237,7 @@ def chunk_gated_delta_rule_nats_bwd(
         compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
         incomplete_block_start_with_ht=incomplete_block_start_with_ht,
         keep_wu_as_kv=keep_wu_as_kv,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
     )
     dv, qdo, v_new = chunk_bwd_dv_qdo_nats_local(q=q,
                                                  k=k,
@@ -259,6 +279,7 @@ def chunk_gated_delta_rule_nats_bwd(
         offset_delta=offset_delta,
         compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
         keep_wu_as_kv=keep_wu_as_kv,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks
     )
 
     dq, dk, dw, dg, d_nats = chunk_bwd_nats_dqkwg(
@@ -273,6 +294,7 @@ def chunk_gated_delta_rule_nats_bwd(
         compute_incomplete_block_scores=compute_incomplete_chunk_scores,
         compute_dnats_for_invalid_blocks=compute_dnats_for_invalid_blocks,
         incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
     )
     dk2, dv, db, dg2 = prepare_wy_repr_nats_bwd(
         k=k,
@@ -297,6 +319,19 @@ def chunk_gated_delta_rule_nats_bwd(
     dg.add_(dg2)
     assert dg.dtype == torch.float32, "dg should be fp32"
     dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
+    if decay_for_non_gdn_blocks:
+        dg = chunk_cumsum_non_gated_chunks(
+            g_cumsum=g,
+            chunk_size=chunk_size,
+            nats_block_size=nats_block_size,
+            nats_block_types=nats_block_types,
+            nats_block_indices=nats_block_indices,
+            chunk_indices_op_nats=chunk_indices_delta_nats,
+            reversed=True,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            offset_op=offset_delta,
+        )
     return dq, dk, dv, db, dg, dh0, d_nats
 
 

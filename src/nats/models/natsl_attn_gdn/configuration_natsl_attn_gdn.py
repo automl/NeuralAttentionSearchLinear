@@ -39,6 +39,7 @@ class NeuralAttentionSearchLineraAttnGDNConfig(PretrainedConfig):
             compute_dnats_for_invalid_blocks_attn: bool = False,
             compute_dnats_for_invalid_blocks_linear_att: bool = False,
             incomplete_block_start_with_ht: bool = True,
+            decay_for_non_gdn_blocks: bool = False,
             attn_apply_pos_encoding: bool = True,
             attn_rope_theta: Optional[float] = 10000.,
             attn_max_position_embeddings: Optional[int] = None,
@@ -84,6 +85,7 @@ class NeuralAttentionSearchLineraAttnGDNConfig(PretrainedConfig):
         self.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
         self.compute_dnats_for_invalid_blocks_linear_att = compute_dnats_for_invalid_blocks_linear_att
         self.incomplete_block_start_with_ht = incomplete_block_start_with_ht
+        self.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks
         self.attn_with_short_conv = attn_with_short_conv
         self.attn_apply_pos_encoding = attn_apply_pos_encoding
         self.attn_rope_theta = attn_rope_theta

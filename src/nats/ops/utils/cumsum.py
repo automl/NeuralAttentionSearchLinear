@@ -30,7 +30,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT']),
 })
 @triton.jit(do_not_specialize=['T', 'TNAtS'])
-def chunk_cumsum_non_gated_chunks(
+def chunk_cumsum_non_gated_chunks_kernel(
         g_cumsum,
         nats_block_types,
         nats_block_indices,
@@ -235,7 +235,7 @@ def chunk_cumsum_non_gated_chunks(g_cumsum: torch.Tensor,
     GNAtS = H // HNAtS
 
     grid = (len(chunk_indices_op_nats), GNAtS)
-    chunk_cumsum_non_gated_chunks[grid](g_cumsum, nats_block_types, nats_block_indices, cu_seqlens, cu_seqlens_nats,
+    chunk_cumsum_non_gated_chunks_kernel[grid](g_cumsum, nats_block_types, nats_block_indices, cu_seqlens, cu_seqlens_nats,
                                         chunk_indices_op_nats, T, TNAtS, H, HNAtS, GNAtS, BT=chunk_size,
                                         NAtS_BLOCK_SIZE=nats_block_size, REVERSED=reversed,
                                         OFFSET_OP=offset_op, N_TYPES=n_opts

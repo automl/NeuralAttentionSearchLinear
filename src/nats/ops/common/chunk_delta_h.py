@@ -73,6 +73,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    DECAY_FOR_NON_GDN_BLOCKS:tl.constexpr,
     N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
     WV_ARE_FLATTENED: tl.constexpr,
 ):
@@ -210,7 +211,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             wv_load_shape0 = T
             wv_load_offset = i_t0
 
-        if USE_G:
+        if USE_G and DECAY_FOR_NON_GDN_BLOCKS:
             # we also need to multiply the gated values from the non-gated-chunks
             block_type_last = tl.load(
                 nats_block_types + (b_o_nats_block - 1), mask=b_o_nats_block > 0, other=1
@@ -396,6 +397,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
     WV_ARE_FLATTENED: tl.constexpr,
     COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
+    DECAY_FOR_NON_GDN_BLOCKS: tl.constexpr,
     USE_DV_LOCAL: tl.constexpr # this value is used if the incomplete block scores are not computed by delta net,  we therefore no longer need the dv local values
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -633,7 +635,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_q = (b_q * scale).to(b_q.dtype)
             b_dh4 += (b_qdo + tl.dot(b_q, b_do.to(b_q.dtype)))-tl.dot(b_w, b_dv.to(b_w.dtype))
 
-        if USE_G:
+        if USE_G and DECAY_FOR_NON_GDN_BLOCKS:
             block_type_last = tl.load(
                 nats_block_types + (b_o_nats_block - 1), mask=b_o_nats_block > 0, other=1
             ).to(tl.int1)
@@ -683,6 +685,7 @@ def chunk_gated_delta_rule_nats_fwd_h(
     offset_delta: int = 1,
     compute_incomplete_chunk_scores:bool = False,
     incomplete_block_start_with_ht:bool = True,
+    decay_for_non_gdn_blocks: bool = False,
     keep_wu_as_kv: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     B, T, H, K, V = *k.shape, u.shape[-1]
@@ -747,6 +750,7 @@ def chunk_gated_delta_rule_nats_fwd_h(
         NAtS_BLOCK_SIZE=nats_block_size,
         N_TYPES=n_opts,
         OFFSET_DELTA=offset_delta,
+        DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         WV_ARE_FLATTENED=not keep_wu_as_kv,
     )
     if save_new_value:
@@ -779,6 +783,7 @@ def chunk_gated_delta_rule_nats_bwd_dhu(
     nats_block_size: int = 64,
     offset_delta: int = 1,
     compute_incomplete_chunk_scores: bool = False,
+    decay_for_non_gdn_blocks: bool= False,
     keep_wu_as_kv: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
@@ -842,6 +847,7 @@ def chunk_gated_delta_rule_nats_bwd_dhu(
         N_TYPES=n_opts,
         OFFSET_DELTA=offset_delta,
         WV_ARE_FLATTENED= not keep_wu_as_kv,
+        DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
     )
     return dh, dh0, dv2

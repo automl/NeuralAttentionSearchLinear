@@ -135,6 +135,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             attn_with_short_conv: bool = False,
             compute_dnats_for_invalid_blocks_attn: bool= False,
             compute_dnats_for_invalid_blocks_linear_att: bool = False,
+            decay_for_non_gdn_blocks: bool = False,
             incomplete_block_start_with_ht: bool = True,
             attn_apply_pos_encoding: bool = True,
             attn_rope_theta: Optional[float] = 10000.,
@@ -189,6 +190,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         self.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
         self.compute_dnats_for_invalid_blocks_linear_att = compute_dnats_for_invalid_blocks_linear_att
         self.incomplete_block_start_with_ht = incomplete_block_start_with_ht
+        self.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks
 
         if self.attn_apply_pos_encoding:
             self.rotary = RotaryEmbedding(dim=self.head_attn_k_dim, base=self.attn_rope_theta)
@@ -474,6 +476,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 compute_dnats_for_invalid_blocks_attn=self.compute_dnats_for_invalid_blocks_attn,
                 compute_dnats_for_invalid_blocks_linear_att=self.compute_dnats_for_invalid_blocks_linear_att,
                 incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
