@@ -173,16 +173,23 @@ def chunk_fwd_kernel_o(
         # [BT, BK] @ [BK, BT] -> [BT, BT]
 
     if USE_G:
-        if WV_ARE_FLATTENED:
-            nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
-            i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
-            i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
+        #if WV_ARE_FLATTENED:
+            #nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
+            #i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
+            #i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
 
         b_o = b_o * tl.exp(b_g)[:, None]
+        if INCOMPLETE_BLOCK_WITH_START_HT:
+            # we also need to incorporate the impact of gatings for b_v_updated
+            last_chunk_is_delta = tl.load(
+                nats_block_types + (load_idx_chunk - 1) * N_TYPES * HNAtS, mask=load_idx_chunk > 0, other=1
+            ).to(tl.int1)
+            b_g_last_last = tl.load(g + (i_t * BT - 1) * H , mask=i_t > 0, other=0.)
+            b_v_updated = tl.where(last_chunk_is_delta, b_v_updated, b_v_updated * b_g_last_last)
         if COMPUTE_INCOMPLETE_BLOCK_SCORES:
             b_A = b_A * tl.exp(b_g[:, None] - b_g[None, :])
 
@@ -356,6 +363,10 @@ def chunk_bwd_kernel_dkwg(
 
     if USE_G:
         dg += i_k * ng * H
+
+        g += bos * H + i_h
+        dg += bos * H + i_h
+
         b_dg_last = tl.zeros([1, ], dtype=tl.float32) if USE_G else None
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
@@ -433,6 +444,22 @@ def chunk_bwd_kernel_dkwg(
         # in this case, we only compute dq
         if COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
             b_dk_virtual = tl.zeros([BT, BK], dtype=tl.float32)
+        if USE_G:
+            next_chunk_is_delta = tl.load(nats_block_types + (load_idx_chunk + 1) * stride_nats_block,
+                                          mask=load_idx_chunk < TNAtS - 1, other=0
+                                          ).to(tl.int1)
+            if next_chunk_is_delta:
+                # if the current chunk is not delta and next chunk is delta, its last g is involved in h, therefore, we
+                # also need to compute the gradients for that
+                b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
+                for i_v in range(tl.cdiv(V, BV)):
+                    p_h_next = tl.make_block_ptr(h + K * V, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+                    p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+
+                    b_h_next = tl.load(p_h_next, boundary_check=(0, 1))
+                    b_dh = tl.load(p_dh, boundary_check=(0, 1))
+                    b_dg_last += (tl.sum(b_h_next * b_dh)) / b_g_last
+
         for i_v in range(tl.cdiv(V, BV)):
             p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
@@ -483,8 +510,6 @@ def chunk_bwd_kernel_dkwg(
         m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
-            g += bos * H + i_h
-            dg += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
@@ -539,8 +564,6 @@ def chunk_bwd_kernel_dkwg(
         m_t = o_t < T
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
-            g += bos * H + i_h
-            dg += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)

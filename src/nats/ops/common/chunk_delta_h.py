@@ -147,6 +147,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     k += (bos * H + i_h) * K
     nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_DELTA
+    nats_block_types +=  (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_DELTA
     # in principle there is no need to store this as we already pads each v, v_new, h to the mulitple of BT
     # we need to check if this is necessary
     #T_NATS_Compute = tl.load(n_nats_blocks + (i_n * HNAtS + i_hnats) * N_TYPES + OFFSET_DELTA) * NAtS_BLOCK_SIZE
@@ -208,6 +209,22 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         else:
             wv_load_shape0 = T
             wv_load_offset = i_t0
+
+        if USE_G:
+            # we also need to multiply the gated values from the non-gated-chunks
+            block_type_last = tl.load(
+                nats_block_types + (b_o_nats_block - 1), mask=b_o_nats_block > 0, other=1
+            ).to(tl.int1)
+            if not block_type_last:  # i_t0 > 0 should not always hold if this is true
+                b_g_last_last = tl.exp(tl.load(g + (i_t0 - 1) * stride_g, mask=i_t0 > 0, other=0))
+                # this only applies if the last chunk is no gated block
+                b_h1 *= b_g_last_last
+                if K > 64:
+                    b_h2 *= b_g_last_last
+                if K > 128:
+                    b_h3 *= b_g_last_last
+                if K > 192:
+                    b_h4 *= b_g_last_last
 
         p_w = tl.make_block_ptr(w, (wv_load_shape0, K), (stride_w, 1), (wv_load_offset, 0), (BT, 64), (1, 0))
         # [BT, 64]
@@ -615,6 +632,21 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_q = b_q * b_g_exp[None, :]
             b_q = (b_q * scale).to(b_q.dtype)
             b_dh4 += (b_qdo + tl.dot(b_q, b_do.to(b_q.dtype)))-tl.dot(b_w, b_dv.to(b_w.dtype))
+
+        if USE_G:
+            block_type_last = tl.load(
+                nats_block_types + (b_o_nats_block - 1), mask=b_o_nats_block > 0, other=1
+            ).to(tl.int1)
+            if not block_type_last:  # i_t0 > 0 should not always hold if this is true
+                b_g_last_last = exp(tl.load(g + (i_t0 - 1) * stride_g, mask=i_t0 > 0, other=0))
+                # this only applies if the last chunk is no gated block
+                b_dh1 *= b_g_last_last
+                if K > 64:
+                    b_dh2 *= b_g_last_last
+                if K > 128:
+                    b_dh3 *= b_g_last_last
+                if K > 192:
+                    b_dh4 *= b_g_last_last
 
     if USE_INITIAL_STATE:
         p_dh0 = tl.make_block_ptr(dh0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
