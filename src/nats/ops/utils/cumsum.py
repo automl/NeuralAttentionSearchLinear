@@ -31,6 +31,7 @@ from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
 @triton.jit(do_not_specialize=['T', 'TNAtS'])
 def chunk_cumsum_non_gated_chunks_kernel(
         g_cumsum,
+        g_cumsum_out,
         nats_block_types,
         nats_block_indices,
         cu_seqlens,
@@ -79,6 +80,7 @@ def chunk_cumsum_non_gated_chunks_kernel(
     stride_g_t = H
 
     g_cumsum += bos * H + i_h
+    g_cumsum_out += bos * H + i_h
     load_idx_chunk = i_t
     i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
     i_nats_block_last = tl.load(
@@ -179,7 +181,10 @@ def chunk_cumsum_non_gated_chunks_kernel(
                 )
                 b_g = tl.load(p_g, boundary_check=(0,))
                 b_g += bg_first_cumsum
-                tl.store(p_g, b_g.to(p_g.dtype.element_ty), boundary_check=(0,))
+                p_g_out = tl.make_block_ptr(
+                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
+                )
+                tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
                 bg_first_cumsum += bg_first
         else:
             i_nats_block_last += 1  # we start with the first gated block and extract its last element
@@ -195,7 +200,10 @@ def chunk_cumsum_non_gated_chunks_kernel(
                 )
                 b_g = tl.load(p_g, boundary_check=(0,))
                 b_g += bg_last_cumsum
-                tl.store(p_g, b_g.to(p_g.dtype.element_ty), boundary_check=(0,))
+                p_g_out = tl.make_block_ptr(
+                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
+                )
+                tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
                 bg_last_cumsum += bg_last
 
 
@@ -237,12 +245,13 @@ def chunk_cumsum_non_gated_chunks(g_cumsum: torch.Tensor,
     GNAtS = H // HNAtS
 
     grid = (len(chunk_indices_op_nats), GNAtS)
-    chunk_cumsum_non_gated_chunks_kernel[grid](g_cumsum, nats_block_types, nats_block_indices, cu_seqlens, cu_seqlens_nats,
+    g_cumsum_out = g_cumsum.clone()
+    chunk_cumsum_non_gated_chunks_kernel[grid](g_cumsum, g_cumsum_out, nats_block_types, nats_block_indices, cu_seqlens, cu_seqlens_nats,
                                         chunk_indices_op_nats, T, TNAtS, H, HNAtS, GNAtS, BT=chunk_size,
                                         NAtS_BLOCK_SIZE=nats_block_size, REVERSED=reversed,
                                         OFFSET_OP=offset_op, N_TYPES=n_opts
                                         )
-    return g_cumsum
+    return g_cumsum_out
 
 def test_cumsum():
     torch.manual_seed(0)
