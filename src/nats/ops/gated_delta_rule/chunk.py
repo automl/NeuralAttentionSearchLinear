@@ -619,7 +619,7 @@ def test_compute_h(dtype=torch.bfloat16):
                                      torch.arange(T_NAtS, device=nats_block_types.device).view(1, -1, 1, 1), T_NAtS)
     nats_block_indices = nats_block_indices.sort(1)[0]
     n_nats_blocks = torch.sum(nats_block_types.long(), dim=1)
-
+    decay_for_non_gdn_blocks = True
     import copy
     output_final_state = True
     cu_seqlens = None
@@ -643,9 +643,9 @@ def test_compute_h(dtype=torch.bfloat16):
     from fla.ops.utils import solve_tril, chunk_local_cumsum
     # from fla.ops.common.
     from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
-    # """
+    """
     # delta net fwd
-    g1 = chunk_local_cumsum(copy.deepcopy(g0) * mask_, chunk_size=64, cu_seqlens=None)
+    g1 = chunk_local_cumsum(g0, chunk_size=64, cu_seqlens=None)
 
     A1 = chunk_scaled_dot_kkt_fwd(
         k=k1,
@@ -704,7 +704,8 @@ def test_compute_h(dtype=torch.bfloat16):
     )
     #"""
 
-    """
+
+    #"""
     res_official = torch.load('res_official.pth')
 
     A1 = res_official['A1'].to(dtype)
@@ -726,20 +727,26 @@ def test_compute_h(dtype=torch.bfloat16):
                                                           chunk_size, )
     compute_incomplete_chunk_scores = True
 
-    # """
+    #"""
 
-    g2 = chunk_local_nats_cumsum(g0, chunk_size=64,
-                                 nats_block_types=nats_block_types,
-                                 nats_block_indices=nats_block_indices,
-                                 n_nats_blocks=n_nats_blocks,
-                                 chunk_indices_op_nats=chunk_indices_delta_nats,
-                                 nats_block_size=nats_block_size,
-                                 offset_op=offset_delta,
-                                 cu_seqlens=cu_seqlens,
-                                 compute_incomplete_chunk_scores=compute_incomplete_chunk_scores
-                                 )
+    g2 = chunk_cumsum_non_gated_chunks(
+            g_cumsum=copy.deepcopy(g1),
+            chunk_size=chunk_size,
+            nats_block_size=nats_block_size,
+            nats_block_types=nats_block_types,
+            nats_block_indices=nats_block_indices,
+            chunk_indices_op_nats=chunk_indices_delta_nats,
+            reversed=False,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            offset_op=offset_delta,
+        )
+
     # obtain WY representation. u is actually the new v.
-
+    if not compute_incomplete_chunk_scores:
+        keep_wu_as_kv = False
+    else:
+        keep_wu_as_kv = True
     A = chunk_scaled_dot_kkt_nats_fwd(
         k=k,
         beta=beta,
@@ -754,9 +761,9 @@ def test_compute_h(dtype=torch.bfloat16):
         chunk_indices_op_nats=chunk_indices_delta_nats,
         offset_op=offset_delta,
         output_dtype=torch.float32,
-        compute_incomplete_chunk_scores=compute_incomplete_chunk_scores
-
+        keep_wu_as_kv=keep_wu_as_kv,
     )
+
 
     A = solve_tril_nats(
         A=A,
@@ -764,14 +771,15 @@ def test_compute_h(dtype=torch.bfloat16):
         n_nats_blocks=n_nats_blocks,
         nats_block_indices=nats_block_indices,
         nats_block_size=nats_block_size,
+        T=q.shape[1],
         cu_seqlens=cu_seqlens,
+        cu_seqlens_nats=cu_seqlens_nats,
         offset_op=offset_delta,
         output_dtype=k.dtype,
-        compute_incomplete_chunk_scores=compute_incomplete_chunk_scores
-
+        keep_wu_as_kv=keep_wu_as_kv,
     )
 
-    # torch.save({'A': A,  'g': g2, }, "A_nats.pth")
+    #torch.save({'A': A,  'g': g2, }, "A_nats.pth")
     # """
 
     """
@@ -782,7 +790,7 @@ def test_compute_h(dtype=torch.bfloat16):
     # import pdb
     # pdb.set_trace()
     #"""
-    # """
+    #"""
     w, u = recompute_w_u_nats_fwd(
         k=k,
         v=v,
@@ -794,12 +802,15 @@ def test_compute_h(dtype=torch.bfloat16):
         chunk_indices_delta_nats=chunk_indices_delta_nats,
         g=g2,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_nats=cu_seqlens_nats,
         nats_block_size=nats_block_size,
         offset_delta=offset_delta,
-        compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
+        keep_wu_as_kv=keep_wu_as_kv,
     )
-    # torch.save({'w': w, 'u': u,}, "tensors.pth.pth")
-    """
+    import pdb
+    pdb.set_trace()
+    torch.save({'w': w, 'u': u,}, "tensors.pth.pth")
+    # """
     wu = torch.load('tensors.pth.pth')
     w = wu['w']
     u = wu['u']
@@ -829,8 +840,12 @@ def test_compute_h(dtype=torch.bfloat16):
         offset_delta=offset_delta,
         compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
         incomplete_block_start_with_ht=True,
-        nats_block_delta_offsets=nats_block_delta_offsets
+        nats_block_delta_offsets=nats_block_delta_offsets,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
     )
+    import pdb
+    pdb.set_trace()
+
 
     # torch.save({'h2': h2, 'v_new': v_new, 'final_state2': final_state2}, "hiddent_states.pth")
     # """
@@ -842,7 +857,7 @@ def test_compute_h(dtype=torch.bfloat16):
     final_state2 = hs['final_state2']
     #"""
 
-    """
+    #"""
     i_start = 0
     torch.set_printoptions(sci_mode=False)
 
@@ -861,8 +876,8 @@ def test_compute_h(dtype=torch.bfloat16):
             # TODO find a proper way to check if this is correct:
 
 
-            import pdb
-            pdb.set_trace()
+            #import pdb
+            #pdb.set_trace()
 
     import pdb
     pdb.set_trace()
@@ -902,33 +917,60 @@ def test_compute_h(dtype=torch.bfloat16):
         nats_block_size=nats_block_size,
         offset_op=offset_delta,
         compute_incomplete_block_scores=compute_incomplete_chunk_scores,
-        vg_is_stored_with_varlen=True,
         incomplete_block_start_with_ht=True,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+        keep_wu_as_kv=True,
     )
+
     o11 = chunk_fwd_o(
         q=q,
         k=k,
         v=v_new,
         h=h1,
-        g=g2,
+        g=g1,
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    import pdb
-    pdb.set_trace()
+
+    A2 = chunk_scaled_dot_kkt_fwd(
+        k=k,
+        g=g1,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        output_dtype=torch.float32
+    )
+
+    A2 = solve_tril(
+        A=A2,
+        cu_seqlens=cu_seqlens,
+        output_dtype=k1.dtype
+    )
+
+    w2, u2 = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A2,
+        g=g1,
+        cu_seqlens=cu_seqlens,
+    )
 
     for b in range(B):
         for h0 in range(H):
             h_nats = h0 // GNAtS
             for i in range(triton.cdiv(T, chunk_size)):
                 nats_block_type = nats_block_types[b, i, h0, offset_delta]
-                o2_vanilla = o11[b, i * 64: i * 64 + 64, h0]
+                #o2_vanilla = o11[b, i * 64: i * 64 + 64, h0]
+                #o2_vanilla = o1[b, i * 64: i * 64 + 64, h0]
                 o1_nats = o2[b, i * 64: i * 64 + 64, h0]
                 if nats_block_type > 0:
+                    o2_vanilla = o1[b, i * 64: i * 64 + 64, h0]
+
                     diff = o1_nats - o2_vanilla
                     print(True)
                     print(f'diff with valid v_new: {diff.abs().max()} at b={b}, h={h0}, i={i}')
                 else:
+                    o2_vanilla = o11[b, i * 64: i * 64 + 64, h0]
 
                     xq = q[b, i * 64: i * 64 + 64, h0]
                     xk = k[b, i * 64: i * 64 + 64, h0]
@@ -937,9 +979,13 @@ def test_compute_h(dtype=torch.bfloat16):
                     msk = torch.arange(0, 64).cuda()[:, None] >= torch.arange(0, 64).cuda()[None, :]
                     b_A = b_A * torch.exp(xg[:, None] - xg[None, :])
                     b_A = torch.where(msk, b_A, 0)
-                    w0 = w[b, i * 64: i * 64 + 64, h0]
+                    w0 = w2[b, i * 64: i * 64 + 64, h0]
+                    if decay_for_non_gdn_blocks and i>0 and nats_block_types[b, i-1, h0, offset_delta]:
+                        h_tmp = h1[b, i, h0]
+                    else:
+                        h_tmp = h1[b, i, h0]
 
-                    diff = o1_nats - (o2_vanilla - b_A.to(h1) @ (w0 @ h1[b, i, h0]) * scale)
+                    diff = o1_nats - (o2_vanilla - b_A.to(h1) @ (w0 @ h_tmp) * scale)
                     print(False)
                     print(f'diff with valid v_new: {diff.abs().max()} at b={b}, h={h0}, i={i}')
 
@@ -1700,5 +1746,5 @@ def test_bwd():
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    # test_compute_h()
-    test_bwd()
+    test_compute_h()
+    #test_bwd()

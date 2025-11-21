@@ -173,9 +173,8 @@ def chunk_cumsum_non_gated_chunks_kernel(
                 bg_cumsum += bg_last_values_cumsum_expanded
                 tl.store(pg_cumsum, bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
     else:
-        n_iters = i_nats_block - i_nats_block_last - 2
+        n_iters = i_nats_block - i_nats_block_last - 1
         if REVERSED:
-            i_nats_block -= 1  # we start with the first gated block and extract its last element
             bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT *stride_g_t , mask=i_nats_block >= 0, other=0)
             for i in range(n_iters):
                 first_idx = (i_nats_block -1 - i) * BT
@@ -292,7 +291,7 @@ def test_cumsum():
                                                           chunk_size, )
 
     g_in = copy.deepcopy(g0)
-    """
+    #"""
     gout1 = chunk_cumsum_non_gated_chunks(copy.deepcopy(g0),
                                           nats_block_size=nats_block_size,
                                           chunk_size=chunk_size,nats_block_types=nats_block_types,
@@ -302,6 +301,7 @@ def test_cumsum():
                                           )
     last_block_is_delta = True
     current_block_is_delta = True
+    """
     for b in range(B):
         for h in range(H):
             g_cumsum = 0
@@ -310,20 +310,19 @@ def test_cumsum():
 
                 g_in1 = g_in[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
                 g_out1 = gout1[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
-                if current_block_is_delta:
+
+                if last_block_is_delta:
                     g_cumsum = 0
                     print((g_in1 - g_out1 + g_cumsum).abs().sum())
                     print('is delta')
                 else:
                     print((g_in1 - g_out1 + g_cumsum).abs().sum())
-
-
-                    g_cumsum += g_in1[..., -1]
-
+                g_cumsum += g_in1[..., -1]
                 last_block_is_delta = current_block_is_delta
     import pdb
     pdb.set_trace()
-    """
+    #"""
+    
     gout2 = chunk_cumsum_non_gated_chunks(copy.deepcopy(g0),
                                           nats_block_size=nats_block_size,
                                           chunk_size=chunk_size,nats_block_types=nats_block_types,
@@ -332,7 +331,7 @@ def test_cumsum():
                                           reversed=True,
                                           offset_op=offset_delta,
                                           )
-    last_block_is_delta = True
+    next_block_is_delta = True
     current_block_is_delta = True
     for b in range(B):
         for h in range(H):
@@ -349,7 +348,9 @@ def test_cumsum():
                 else:
                     print((g_in1 - g_out1 + g_cumsum).abs().sum())
 
-                    g_cumsum += g_in1[..., 0]
+                g_cumsum += g_in1[..., 0]
+                next_block_is_delta = current_block_is_delta
+    # """
 
     import pdb
     pdb.set_trace()

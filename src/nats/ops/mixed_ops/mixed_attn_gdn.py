@@ -175,7 +175,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         ctx.incomplete_block_start_with_ht = incomplete_block_start_with_ht
         ctx.keep_wu_as_kv = keep_wu_as_kv
         ctx.incomplete_block_strategy = incomplete_block_strategy
-        ctx.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks,
+        ctx.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks
 
         return o_gated_delta, o_attn, final_state_gated_delta
 

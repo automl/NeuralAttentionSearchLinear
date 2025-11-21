@@ -147,6 +147,10 @@ def chunk_fwd_kernel_o(
             chunk_is_delta = tl.load(nats_block_types + load_idx_chunk * N_TYPES * HNAtS).to(tl.int1)
             b_v_updated = tl.zeros([BT, BV], dtype=tl.float32)
 
+    if USE_G:
+
+        g += bos * H + i_h
+
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
 
@@ -168,7 +172,6 @@ def chunk_fwd_kernel_o(
                     p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_t * BT, BK * i_k), (BT, BK), (1, 0))
                     b_w = tl.load(p_w, boundary_check=(0, 1))
                     b_v_updated += tl.dot(b_w, b_h.to(b_w.dtype))
-
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, b_h)
         # [BT, BK] @ [BK, BT] -> [BT, BT]
@@ -179,18 +182,10 @@ def chunk_fwd_kernel_o(
             #i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
             #i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
-        g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
 
         b_o = b_o * tl.exp(b_g)[:, None]
-        if INCOMPLETE_BLOCK_WITH_START_HT and DECAY_FOR_NON_GDN_BLOCKS:
-            # we also need to incorporate the impact of gatings for b_v_updated
-            last_chunk_is_delta = tl.load(
-                nats_block_types + (load_idx_chunk - 1) * N_TYPES * HNAtS, mask=load_idx_chunk > 0, other=1
-            ).to(tl.int1)
-            b_g_last_last = tl.load(g + (i_t * BT - 1) * H, mask=i_t > 0, other=0.)
-            b_v_updated = tl.where(last_chunk_is_delta, b_v_updated, b_v_updated * b_g_last_last)
         if COMPUTE_INCOMPLETE_BLOCK_SCORES:
             b_A = b_A * tl.exp(b_g[:, None] - b_g[None, :])
 
@@ -446,21 +441,6 @@ def chunk_bwd_kernel_dkwg(
         # in this case, we only compute dq
         if COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
             b_dk_virtual = tl.zeros([BT, BK], dtype=tl.float32)
-        if USE_G and DECAY_FOR_NON_GDN_BLOCKS:
-            next_chunk_is_delta = tl.load(nats_block_types + (load_idx_chunk + 1) * stride_nats_block,
-                                          mask=load_idx_chunk < TNAtS - 1, other=0
-                                          ).to(tl.int1)
-            if next_chunk_is_delta:
-                # if the current chunk is not delta and next chunk is delta, its last g is involved in h, therefore, we
-                # also need to compute the gradients for that
-                b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
-                for i_v in range(tl.cdiv(V, BV)):
-                    p_h_next = tl.make_block_ptr(h + K * V, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-                    p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-
-                    b_h_next = tl.load(p_h_next, boundary_check=(0, 1))
-                    b_dh = tl.load(p_dh, boundary_check=(0, 1))
-                    b_dg_last += (tl.sum(b_h_next * b_dh)) / b_g_last
 
         for i_v in range(tl.cdiv(V, BV)):
             p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
@@ -1170,12 +1150,6 @@ def chunk_bwd_kernel_qdo_local(
                 b_qdo4 -= tl.dot(b_w, b_dv.to(b_w.dtype))
 
                 b_v += tl.dot(tl.trans(b_w), b_h4.to(b_w.dtype))
-            if DECAY_FOR_NON_GDN_BLOCKS:
-                last_chunk_is_delta = tl.load(
-                    nats_block_types + (load_idx_chunk - 1) * N_TYPES * HNAtS, mask=load_idx_chunk > 0, other=1
-                ).to(tl.int1)
-                b_g_last_last = tl.load(g + (i_t * BT - 1) * H, mask=i_t > 0, other=0.)
-                b_v = tl.where(last_chunk_is_delta, b_v, b_v * b_g_last_last)
 
             p_v = tl.make_block_ptr(v, (i_t_next, V), (stride_vt, 1), (i_tq, i_v * BV), (BT, BV), (1, 0))
             b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
