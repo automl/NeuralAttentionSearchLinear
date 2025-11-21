@@ -189,7 +189,7 @@ def chunk_fwd_kernel_o(
             last_chunk_is_delta = tl.load(
                 nats_block_types + (load_idx_chunk - 1) * N_TYPES * HNAtS, mask=load_idx_chunk > 0, other=1
             ).to(tl.int1)
-            b_g_last_last = tl.load(g + (i_t * BT - 1) * H , mask=i_t > 0, other=0.)
+            b_g_last_last = tl.load(g + (i_t * BT - 1) * H, mask=i_t > 0, other=0.)
             b_v_updated = tl.where(last_chunk_is_delta, b_v_updated, b_v_updated * b_g_last_last)
         if COMPUTE_INCOMPLETE_BLOCK_SCORES:
             b_A = b_A * tl.exp(b_g[:, None] - b_g[None, :])
@@ -979,6 +979,7 @@ def chunk_bwd_kernel_qdo_local(
         IS_VARLEN: tl.constexpr,
         N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
         INCOMPLETE_BLOCK_WITH_START_HT: tl.constexpr,
+        DECAY_FOR_NON_GDN_BLOCKS: tl.constexpr,
 ):
     # i_t, i_bh = tl.program_id(0), tl.program_id(1)
     # i_b, i_h = i_bh // H, i_bh % H
@@ -1169,6 +1170,12 @@ def chunk_bwd_kernel_qdo_local(
                 b_qdo4 -= tl.dot(b_w, b_dv.to(b_w.dtype))
 
                 b_v += tl.dot(tl.trans(b_w), b_h4.to(b_w.dtype))
+            if DECAY_FOR_NON_GDN_BLOCKS:
+                last_chunk_is_delta = tl.load(
+                    nats_block_types + (load_idx_chunk - 1) * N_TYPES * HNAtS, mask=load_idx_chunk > 0, other=1
+                ).to(tl.int1)
+                b_g_last_last = tl.load(g + (i_t * BT - 1) * H, mask=i_t > 0, other=0.)
+                b_v = tl.where(last_chunk_is_delta, b_v, b_v * b_g_last_last)
 
             p_v = tl.make_block_ptr(v, (i_t_next, V), (stride_vt, 1), (i_tq, i_v * BV), (BT, BV), (1, 0))
             b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
@@ -1351,6 +1358,7 @@ def chunk_bwd_dv_qdo_nats_local(
         compute_incomplete_block_scores: bool = True,
         pre_compute_qdo: bool = True,  # TODO check if we really need this!
         incomplete_block_start_with_ht: bool = True,
+        decay_for_non_gdn_blocks:bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if compute_incomplete_block_scores:
         dv = chunk_bwd_dv_local(q, k, do, g, g_gamma, scale, cu_seqlens, chunk_size)
@@ -1474,6 +1482,7 @@ def chunk_bwd_dv_qdo_nats_local(
             N_TYPES=n_opts,
             OFFSET_OP=offset_op,
             INCOMPLETE_BLOCK_WITH_START_HT=incomplete_block_start_with_ht,
+            DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         )
     else:
         qdo = None

@@ -255,6 +255,7 @@ def chunk_gated_delta_rule_nats_bwd(
                                                  offset_op=offset_delta,
                                                  compute_incomplete_block_scores=compute_incomplete_chunk_scores,
                                                  incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+                                                 decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
                                                  )
 
     dh, dh0, dv = chunk_gated_delta_rule_nats_bwd_dhu(
