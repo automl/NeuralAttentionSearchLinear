@@ -201,7 +201,7 @@ def chunk_cumsum_non_gated_chunks_kernel(
                 b_g = tl.load(p_g, boundary_check=(0,))
                 b_g += bg_last_cumsum
                 p_g_out = tl.make_block_ptr(
-                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
+                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block + 1 + i) * BT,), (BT,), (0,)
                 )
                 tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
                 bg_last_cumsum += bg_last
