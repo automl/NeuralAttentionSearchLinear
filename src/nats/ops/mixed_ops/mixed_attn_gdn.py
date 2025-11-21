@@ -74,6 +74,8 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
 
         incomplete_block_start_with_ht = incomplete_block_strategy.gated_delta_net and incomplete_block_start_with_ht
 
+        nats_block_types = torch.round(nats_block_types) # TODO  we need to investigate this further...
+
         # TODO this is only for head first is True,
         assert nats_block_size >= CHUNK_SIZE
         TNAtS = nats_block_types.shape[1]

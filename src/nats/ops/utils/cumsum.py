@@ -24,11 +24,6 @@ from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
     key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs
 )
-@triton.jit
-def chunk_cumsum_non_gated_chunks_kernel(
-        g_cumsum,):
-    pass
-
 @triton.heuristics({
     'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT']),
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
@@ -175,7 +170,7 @@ def chunk_cumsum_non_gated_chunks_kernel(
     else:
         n_iters = i_nats_block - i_nats_block_last - 1
         if REVERSED:
-            bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT *stride_g_t , mask=i_nats_block >= 0, other=0)
+            bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT * stride_g_t , mask=i_nats_block >= 0, other=0)
             for i in range(n_iters):
                 first_idx = (i_nats_block -1 - i) * BT
                 bg_first = tl.load(g_cumsum + first_idx * stride_g_t)
