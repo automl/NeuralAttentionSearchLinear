@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
+import copy
 from typing import Optional
 
 import torch
@@ -14,20 +14,24 @@ from fla.utils import check_shared_mem, input_guard, is_nvidia_hopper
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
+from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        # triton.Config({'BV': BV, 'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        # for BV in [128, 64,]
-        # for BK in [128, 64,]
-        for num_warps in  NUM_WARPS
-        for num_stages in [2, 3, 4]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4, 8]
     ],
-    key=['H', 'K', 'V', 'USE_G'],
+    key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
+    **autotune_cache_kwargs
 )
+@triton.jit
+def chunk_cumsum_non_gated_chunks_kernel(
+        g_cumsum,):
+    pass
+
 @triton.heuristics({
     'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT']),
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
 @triton.jit(do_not_specialize=['T', 'TNAtS'])
 def chunk_cumsum_non_gated_chunks_kernel(
@@ -51,7 +55,7 @@ def chunk_cumsum_non_gated_chunks_kernel(
         N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
 ):
     # and goes towards the end of last nats block
-    i_t_, i_gnats = tl.program_id(1), tl.program_id(2)
+    i_t_, i_gnats = tl.program_id(0), tl.program_id(1)
 
     off_bh_nats = tl.load(chunk_indices_op_nats + i_t_ * 2).to(tl.int32)
     i_t = tl.load(chunk_indices_op_nats + i_t_ * 2 + 1).to(tl.int32)
@@ -84,7 +88,7 @@ def chunk_cumsum_non_gated_chunks_kernel(
     i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
     i_nats_block_last = tl.load(
         nats_block_indices + (load_idx_chunk - 1) * stride_block_types_t,
-        mask=load_idx_chunk > 1, other=-1
+        mask=load_idx_chunk > 0, other=-1
     ).to(tl.int32)  # if the current block is the first one, we do not need to do anything, otherwie,
 
     # we only need the cases where i_nats_block_next - i_nats_block > 2, otherwise, if there is only one gated
@@ -169,27 +173,31 @@ def chunk_cumsum_non_gated_chunks_kernel(
                 bg_cumsum += bg_last_values_cumsum_expanded
                 tl.store(pg_cumsum, bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
     else:
-        i_nats_block_last += 1  # we start with the first gated block and extract its last element
-        n_iters = i_nats_block - i_nats_block_last - 1
+        n_iters = i_nats_block - i_nats_block_last - 2
         if REVERSED:
-            bg_first_cumsum = tl.load(g_cumsum + (i_nats_block -1) * BT *stride_g_t , mask=i_nats_block > 1, other=0)
+            i_nats_block -= 1  # we start with the first gated block and extract its last element
+            bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT *stride_g_t , mask=i_nats_block >= 0, other=0)
             for i in range(n_iters):
-                bg_first = tl.load(g_cumsum, (i_nats_block_last + i) * BT)
+                first_idx = (i_nats_block -1 - i) * BT
+                bg_first = tl.load(g_cumsum + first_idx * stride_g_t)
                 p_g = tl.make_block_ptr(
-                    g_cumsum, (T,), (stride_g_t,), ((i_nats_block_last + i) * BT,), (BT,), (0,)
+                    g_cumsum, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
                 )
                 b_g = tl.load(p_g, boundary_check=(0,))
                 b_g += bg_first_cumsum
                 tl.store(p_g, b_g.to(p_g.dtype.element_ty), boundary_check=(0,))
                 bg_first_cumsum += bg_first
         else:
+            i_nats_block_last += 1  # we start with the first gated block and extract its last element
+
             last_idx = min(i_nats_block_last * BT + BT, T) - 1
             bg_last_cumsum = tl.load(g_cumsum + last_idx * stride_g_t, )
+
             for i in range(n_iters):
-                last_idx = min((i_nats_block_last + i) * BT + BT, T) - 1
+                last_idx = min((i_nats_block_last + i + 1) * BT + BT, T) - 1
                 bg_last = tl.load(g_cumsum + last_idx * stride_g_t, )
                 p_g = tl.make_block_ptr(
-                    g_cumsum, (T, ), (stride_g_t, ), ((i_nats_block_last + i) * BT, ), (BT, ), (0,)
+                    g_cumsum, (T, ), (stride_g_t, ), ((i_nats_block_last + 1 + i) * BT, ), (BT, ), (0,)
                 )
                 b_g = tl.load(p_g, boundary_check=(0,))
                 b_g += bg_last_cumsum
@@ -241,3 +249,117 @@ def chunk_cumsum_non_gated_chunks(g_cumsum: torch.Tensor,
                                         OFFSET_OP=offset_op, N_TYPES=n_opts
                                         )
     return g_cumsum
+
+def test_cumsum():
+    torch.manual_seed(0)
+    from nats.utils import check_fp16_dtype
+    import triton
+    from torch.nn import functional as F
+    dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    dtype = torch.float16
+
+    B = 2
+    H = 4
+    HNatS = 4
+    T = 512
+    N_TYPES = 3
+    GNAtS = H // HNatS
+    delta_offset = 1
+    K = 128
+    V = 256
+    NATS_Chunk = 64
+    chunk_size = 64
+    T_NAtS = triton.cdiv(T, NATS_Chunk)
+    device = torch.device('cuda')
+
+    g0 = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    logits = torch.randn(B, T_NAtS, HNatS, N_TYPES, device=torch.device('cuda'), dtype=dtype)
+    nats_block_types = torch.nn.functional.gumbel_softmax(logits, dim=-1, hard=True)
+    nats_block_types[:, -1, :] = 1.
+    nats_block_indices = torch.where(nats_block_types == 1.,
+                                     torch.arange(T_NAtS, device=nats_block_types.device).view(1, -1, 1, 1), T_NAtS)
+    nats_block_indices = nats_block_indices.sort(1)[0]
+    n_nats_blocks = torch.sum(nats_block_types.long(), dim=1)
+
+    nats_block_size = NATS_Chunk
+    offset_delta = delta_offset
+    cu_seqlens_nats = None
+    from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, \
+        compute_starting_idx_for_chunks
+
+    chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., delta_offset],
+                                                          nats_block_size,
+                                                          chunk_size, )
+
+    g_in = copy.deepcopy(g0)
+    """
+    gout1 = chunk_cumsum_non_gated_chunks(copy.deepcopy(g0),
+                                          nats_block_size=nats_block_size,
+                                          chunk_size=chunk_size,nats_block_types=nats_block_types,
+                                          nats_block_indices=nats_block_indices,
+                                          chunk_indices_op_nats=chunk_indices_delta_nats,
+                                          offset_op=offset_delta,
+                                          )
+    last_block_is_delta = True
+    current_block_is_delta = True
+    for b in range(B):
+        for h in range(H):
+            g_cumsum = 0
+            for i in range(T_NAtS):
+                current_block_is_delta = nats_block_types[b,i, h, offset_delta]
+
+                g_in1 = g_in[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                g_out1 = gout1[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                if current_block_is_delta:
+                    g_cumsum = 0
+                    print((g_in1 - g_out1 + g_cumsum).abs().sum())
+                    print('is delta')
+                else:
+                    print((g_in1 - g_out1 + g_cumsum).abs().sum())
+
+
+                    g_cumsum += g_in1[..., -1]
+
+                last_block_is_delta = current_block_is_delta
+    import pdb
+    pdb.set_trace()
+    """
+    gout2 = chunk_cumsum_non_gated_chunks(copy.deepcopy(g0),
+                                          nats_block_size=nats_block_size,
+                                          chunk_size=chunk_size,nats_block_types=nats_block_types,
+                                          nats_block_indices=nats_block_indices,
+                                          chunk_indices_op_nats=chunk_indices_delta_nats,
+                                          reversed=True,
+                                          offset_op=offset_delta,
+                                          )
+    last_block_is_delta = True
+    current_block_is_delta = True
+    for b in range(B):
+        for h in range(H):
+            g_cumsum = 0
+            for i in range(T_NAtS-1, -1, -1):
+                current_block_is_delta = nats_block_types[b,i, h, offset_delta]
+
+                g_in1 = g_in[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                g_out1 = gout2[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                if current_block_is_delta:
+                    g_cumsum = 0
+                    print((g_in1 - g_out1 + g_cumsum).abs().sum())
+                    print('is delta')
+                else:
+                    print((g_in1 - g_out1 + g_cumsum).abs().sum())
+
+                    g_cumsum += g_in1[..., 0]
+
+    import pdb
+    pdb.set_trace()
+
+
+
+
+
+
+if __name__ == "__main__":
+    # only works on post-Ampere GPUs right now
+    # test_compute_h()
+    test_cumsum()
