@@ -361,9 +361,6 @@ def chunk_bwd_kernel_dkwg(
     if USE_G:
         dg += i_k * ng * H
 
-        g += bos * H + i_h
-        dg += bos * H + i_h
-
         b_dg_last = tl.zeros([1, ], dtype=tl.float32) if USE_G else None
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
@@ -492,6 +489,8 @@ def chunk_bwd_kernel_dkwg(
         m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
+            g += bos * H + i_h
+            dg += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
@@ -546,6 +545,8 @@ def chunk_bwd_kernel_dkwg(
         m_t = o_t < T
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
+            g += bos * H + i_h
+            dg += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
