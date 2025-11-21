@@ -147,10 +147,6 @@ def chunk_fwd_kernel_o(
             chunk_is_delta = tl.load(nats_block_types + load_idx_chunk * N_TYPES * HNAtS).to(tl.int1)
             b_v_updated = tl.zeros([BT, BV], dtype=tl.float32)
 
-    if USE_G:
-
-        g += bos * H + i_h
-
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
 
@@ -182,6 +178,7 @@ def chunk_fwd_kernel_o(
             #i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
             #i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
+        g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
 
