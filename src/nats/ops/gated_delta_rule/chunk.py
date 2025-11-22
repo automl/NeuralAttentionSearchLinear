@@ -322,7 +322,7 @@ def chunk_gated_delta_rule_nats_bwd(
     dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
     if decay_for_non_gdn_blocks:
         dg = chunk_cumsum_non_gated_chunks(
-            g_cumsum=g,
+            g_cumsum=dg,
             chunk_size=chunk_size,
             nats_block_size=nats_block_size,
             nats_block_types=nats_block_types,
@@ -643,7 +643,7 @@ def test_compute_h(dtype=torch.bfloat16):
     from fla.ops.utils import solve_tril, chunk_local_cumsum
     # from fla.ops.common.
     from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
-    """
+    #"""
     # delta net fwd
     g1 = chunk_local_cumsum(g0, chunk_size=64, cu_seqlens=None)
 
@@ -705,7 +705,7 @@ def test_compute_h(dtype=torch.bfloat16):
     #"""
 
 
-    #"""
+    """
     res_official = torch.load('res_official.pth')
 
     A1 = res_official['A1'].to(dtype)
@@ -807,10 +807,8 @@ def test_compute_h(dtype=torch.bfloat16):
         offset_delta=offset_delta,
         keep_wu_as_kv=keep_wu_as_kv,
     )
-    import pdb
-    pdb.set_trace()
-    torch.save({'w': w, 'u': u,}, "tensors.pth.pth")
-    # """
+    #torch.save({'w': w, 'u': u,}, "tensors.pth.pth")
+    """
     wu = torch.load('tensors.pth.pth')
     w = wu['w']
     u = wu['u']
