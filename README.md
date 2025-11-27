@@ -1,11 +1,19 @@
-# SeqModels
+# Neural Attention Search
 
 
-a family of new sequential models
+Searching between full transformer models and linear attention models
 
-- Free software: BSD license
-- Documentation: https://seqmodels.readthedocs.io.
-
+usage: 
+create a new conda environment with: 
+```angular2html
+python==3.11.13 
+```
+install dependencies, add NeuralAttentionSearchLinear/src to your PYTHONPATH
+then
+```angular2html
+import natsl
+```
+such that the model will be registered to the huggingface
 
 ## Features
 
