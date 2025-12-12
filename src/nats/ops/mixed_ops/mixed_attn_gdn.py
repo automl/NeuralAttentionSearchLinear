@@ -51,6 +51,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
                 output_final_state_gated_delta: bool = False,
                 compute_dnats_for_invalid_blocks_attn: bool = False,
                 compute_dnats_for_invalid_blocks_linear_att: bool = True,
+                decay_for_non_gdn_blocks: bool=False,
                 incomplete_block_start_with_ht: bool = True,
                 use_g_for_attn: bool = True,
                 lattn_use_qk_l2norm_in_kernel: bool = True,
@@ -72,6 +73,8 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             keep_wu_as_kv = True
 
         incomplete_block_start_with_ht = incomplete_block_strategy.gated_delta_net and incomplete_block_start_with_ht
+
+        nats_block_types = torch.round(nats_block_types) # TODO  we need to investigate this further...
 
         # TODO this is only for head first is True,
         assert nats_block_size >= CHUNK_SIZE
@@ -147,6 +150,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             offset_delta=OFFSET_GATED_DELTA_NET,
             compute_incomplete_chunk_scores=incomplete_block_strategy.gated_delta_net,
             incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+            decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
             keep_wu_as_kv=keep_wu_as_kv,
         )
 
@@ -173,6 +177,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         ctx.incomplete_block_start_with_ht = incomplete_block_start_with_ht
         ctx.keep_wu_as_kv = keep_wu_as_kv
         ctx.incomplete_block_strategy = incomplete_block_strategy
+        ctx.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks
 
         return o_gated_delta, o_attn, final_state_gated_delta
 
@@ -238,6 +243,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             compute_dnats_for_invalid_blocks=ctx.compute_dnats_for_invalid_blocks_linear_att,
             incomplete_block_start_with_ht=ctx.incomplete_block_start_with_ht,
             keep_wu_as_kv=ctx.keep_wu_as_kv,
+            decay_for_non_gdn_blocks=ctx.decay_for_non_gdn_blocks,
         )
         # TODO if we want a uniform dv, we might need some adjustments here!!!
         #  check how to solve problems for dg for transformer
@@ -253,7 +259,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
                dh0_gated_delta, \
                dg_gated_delta, db, dnats, None, \
                None, None, None, None, \
-               None, None, None, None, None, None, None, None
+               None, None, None, None, None, None, None, None, None
 
 
 def nats_mixed_attn_gdn(
@@ -271,6 +277,7 @@ def nats_mixed_attn_gdn(
         output_final_state_gated_delta: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool = False,  # TODO this is not activated yet, we need to fix that!
         compute_dnats_for_invalid_blocks_linear_att: bool = True,
+        decay_for_non_gdn_blocks:bool=False,
         incomplete_block_start_with_ht: bool = True,
         use_g_for_attn: bool = False,
         lattn_use_qk_l2norm_in_kernel: bool = True,
@@ -289,6 +296,7 @@ def nats_mixed_attn_gdn(
         output_final_state_gated_delta,
         compute_dnats_for_invalid_blocks_attn,
         compute_dnats_for_invalid_blocks_linear_att,
+        decay_for_non_gdn_blocks,
         incomplete_block_start_with_ht,
         use_g_for_attn, lattn_use_qk_l2norm_in_kernel
     )

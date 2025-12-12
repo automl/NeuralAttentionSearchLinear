@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from .cumsum import (
-    chunk_global_cumsum,
-    chunk_global_cumsum_scalar,
-    chunk_global_cumsum_vector,
-    chunk_local_nats_cumsum,
-    chunk_local_nats_cumsum_scalar,
-    chunk_local_nats_cumsum_vector
+    chunk_cumsum_non_gated_chunks,
 )
 from .index import (
     prepare_chunk_indices,
@@ -26,12 +21,7 @@ from .softmax import softmax_bwd, softmax_fwd
 from .solve_tril import solve_tril_nats
 
 __all__ = [
-    'chunk_global_cumsum',
-    'chunk_global_cumsum_scalar',
-    'chunk_global_cumsum_vector',
-    'chunk_local_nats_cumsum',
-    'chunk_local_nats_cumsum_scalar',
-    'chunk_local_nats_cumsum_vector',
+    'chunk_cumsum_non_gated_chunks',
     'pack_sequence',
     'unpack_sequence',
     'prepare_chunk_indices',

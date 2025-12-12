@@ -93,6 +93,7 @@ class NeuralAttentionSearchLinearAttnGDNBlock(nn.Module):
                 compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,
                 compute_dnats_for_invalid_blocks_linear_att=config.compute_dnats_for_invalid_blocks_attn,
                 incomplete_block_start_with_ht=config.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=config.decay_for_non_gdn_blocks,
                 attn_rope_theta=config.attn_rope_theta,
                 attn_apply_pos_encoding=config.attn_apply_pos_encoding,
                 attn_max_position_embeddings=config.attn_max_position_embeddings,

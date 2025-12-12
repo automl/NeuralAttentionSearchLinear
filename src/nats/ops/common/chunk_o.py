@@ -64,6 +64,7 @@ def chunk_fwd_kernel_o(
         N_TYPES: tl.constexpr,
         OFFSET_OP: tl.constexpr,
         COMPUTE_INCOMPLETE_BLOCK_SCORES: tl.constexpr,
+        DECAY_FOR_NON_GDN_BLOCKS:tl.constexpr,
         WV_ARE_FLATTENED: tl.constexpr,
         USE_G: tl.constexpr,
         USE_G_GAMMA: tl.constexpr,
@@ -167,16 +168,15 @@ def chunk_fwd_kernel_o(
                     p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_t * BT, BK * i_k), (BT, BK), (1, 0))
                     b_w = tl.load(p_w, boundary_check=(0, 1))
                     b_v_updated += tl.dot(b_w, b_h.to(b_w.dtype))
-
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, b_h)
         # [BT, BK] @ [BK, BT] -> [BT, BT]
 
     if USE_G:
-        if WV_ARE_FLATTENED:
-            nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
-            i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
-            i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
+        #if WV_ARE_FLATTENED:
+            #nats_block_indices += (bos_nats * HNAtS + i_hnats) * N_TYPES + OFFSET_OP
+            #i_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_nats_block)
+            #i_t0 = i_nats_block * NAtS_BLOCK_SIZE + i_t_nats_offset * BT
 
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
@@ -274,6 +274,7 @@ def chunk_bwd_kernel_dkwg(
         COMPUTE_INCOMPLETE_BLOCK_SCORES: tl.constexpr,
         WV_ARE_FLATTENED: tl.constexpr,
         COMPUTE_DNATS_FOR_INCOMPLETE_SCORES: tl.constexpr,
+        DECAY_FOR_NON_GDN_BLOCKS:tl.constexpr,
         N_TYPES: tl.constexpr,
         USE_DW: tl.constexpr,
         IS_VARLEN: tl.constexpr,
@@ -356,6 +357,7 @@ def chunk_bwd_kernel_dkwg(
 
     if USE_G:
         dg += i_k * ng * H
+
         b_dg_last = tl.zeros([1, ], dtype=tl.float32) if USE_G else None
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
@@ -433,6 +435,7 @@ def chunk_bwd_kernel_dkwg(
         # in this case, we only compute dq
         if COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
             b_dk_virtual = tl.zeros([BT, BK], dtype=tl.float32)
+
         for i_v in range(tl.cdiv(V, BV)):
             p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
@@ -954,6 +957,7 @@ def chunk_bwd_kernel_qdo_local(
         IS_VARLEN: tl.constexpr,
         N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
         INCOMPLETE_BLOCK_WITH_START_HT: tl.constexpr,
+        DECAY_FOR_NON_GDN_BLOCKS: tl.constexpr,
 ):
     # i_t, i_bh = tl.program_id(0), tl.program_id(1)
     # i_b, i_h = i_bh // H, i_bh % H
@@ -1190,6 +1194,7 @@ def chunk_fwd_nats_o(
         offset_op: int = 0,
         compute_incomplete_block_scores: bool = False,
         incomplete_block_start_with_ht: bool = True,
+        decay_for_non_gdn_blocks:bool=False,
         keep_wu_as_kv: bool = True,
 ) -> torch.Tensor:
     B, T, H, K, V = *q.shape, v.shape[-1]
@@ -1245,6 +1250,7 @@ def chunk_fwd_nats_o(
         OFFSET_OP=offset_op,
         WV_ARE_FLATTENED=not keep_wu_as_kv,
         COMPUTE_INCOMPLETE_BLOCK_SCORES=compute_incomplete_block_scores,
+        DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         INCOMPLETE_BLOCK_WITH_START_HT=incomplete_block_start_with_ht,
     )
     return o
@@ -1324,6 +1330,7 @@ def chunk_bwd_dv_qdo_nats_local(
         compute_incomplete_block_scores: bool = True,
         pre_compute_qdo: bool = True,  # TODO check if we really need this!
         incomplete_block_start_with_ht: bool = True,
+        decay_for_non_gdn_blocks:bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if compute_incomplete_block_scores:
         dv = chunk_bwd_dv_local(q, k, do, g, g_gamma, scale, cu_seqlens, chunk_size)
@@ -1447,6 +1454,7 @@ def chunk_bwd_dv_qdo_nats_local(
             N_TYPES=n_opts,
             OFFSET_OP=offset_op,
             INCOMPLETE_BLOCK_WITH_START_HT=incomplete_block_start_with_ht,
+            DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         )
     else:
         qdo = None
@@ -1480,6 +1488,7 @@ def chunk_bwd_nats_dqkwg(
         offset_op: int = 0,
         compute_incomplete_block_scores: bool = False,
         compute_dnats_for_invalid_blocks: bool = True,
+        decay_for_non_gdn_blocks:bool=False,
         incomplete_block_start_with_ht: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -1550,6 +1559,7 @@ def chunk_bwd_nats_dqkwg(
         OFFSET_OP=offset_op,
         COMPUTE_INCOMPLETE_BLOCK_SCORES=compute_incomplete_block_scores,
         WV_ARE_FLATTENED=wv_are_flattened,
+        DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         COMPUTE_DNATS_FOR_INCOMPLETE_SCORES=compute_dnats_for_invalid_blocks,
         INCOMPLETE_BLOCKS_START_WITH_HT=incomplete_block_start_with_ht
     )
