@@ -357,8 +357,12 @@ def chunk_bwd_kernel_dkwg(
 
     if USE_G:
         dg += i_k * ng * H
-
         b_dg_last = tl.zeros([1, ], dtype=tl.float32) if USE_G else None
+        g += bos * H + i_h
+        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
+
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
@@ -390,6 +394,9 @@ def chunk_bwd_kernel_dkwg(
     b_ds = tl.zeros([BT, BT], dtype=tl.float32)
     b_dw = tl.zeros([BT, BK], dtype=tl.float32) if USE_DW else None
     b_nats_opt = 0.
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
 
     if chunk_is_delta:
         for i_v in range(tl.cdiv(V, BV)):
@@ -428,8 +435,10 @@ def chunk_bwd_kernel_dkwg(
         p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-
-        b_nats_opt += tl.sum((b_k * b_dk))
+        if USE_G:
+            b_nats_opt += tl.sum((b_k * b_dk) * tl.where(m_t, tl.exp(-b_g + b_g_last), 0)[:, None])
+        else:
+            b_nats_opt += tl.sum((b_k * b_dk))
         tl.store(dnats + i_t * H, b_nats_opt.to(dnats.dtype.element_ty))
     else:
         # in this case, we only compute dq
@@ -475,22 +484,19 @@ def chunk_bwd_kernel_dkwg(
         b_k = tl.load(p_k, boundary_check=(0, 1))
 
         if COMPUTE_DNATS_FOR_INCOMPLETE_SCORES:
-            b_nats_opt += tl.sum((b_dk_virtual * b_k))
+            if USE_G:
+                b_nats_opt += tl.sum((b_dk_virtual * b_k) * tl.where(m_t, tl.exp(-b_g + b_g_last), 0)[:, None])
+            else:
+                b_nats_opt += tl.sum((b_dk_virtual * b_k))
             tl.store(dnats + i_t * H, b_nats_opt.to(dnats.dtype.element_ty))
 
     p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     if COMPUTE_INCOMPLETE_BLOCK_SCORES:
-        o_t = i_t * BT + tl.arange(0, BT)
-        m_t = o_t < T
         m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
-            g += bos * H + i_h
             dg += bos * H + i_h
-            p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
-            b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
             b_dg_last *= tl.exp(b_g_last)
 
             b_dq = b_dq * tl.exp(b_g)[:, None] * scale
@@ -538,15 +544,9 @@ def chunk_bwd_kernel_dkwg(
             tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     else:
         # in this case, we will not compute any b_s related items since they will not be computed
-        o_t = i_t * BT + tl.arange(0, BT)
-        m_t = o_t < T
         if USE_G:
             b_dg = tl.zeros([BT, ], dtype=tl.float32)
-            g += bos * H + i_h
             dg += bos * H + i_h
-            p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
-            b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
             b_dg_last *= tl.exp(b_g_last)
             b_dq = b_dq * tl.exp(b_g)[:, None] * scale
             b_dg += tl.sum(b_dq * b_q, axis=1)
