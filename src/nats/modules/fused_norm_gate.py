@@ -20,8 +20,10 @@ from fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_gua
     'HAS_X_WEIGHTS': lambda args: args['x_weights_after_norm'] is not None,
     'STORE_RESIDUAL_OUT': lambda args: args['residual_out1'] is not None,
     'HAS_RESIDUAL': lambda args: args['residual'] is not None,
-    'HAS_WEIGHT': lambda args: args['w'] is not None,
-    'HAS_BIAS': lambda args: args['b'] is not None,
+    'HAS_WEIGHT1': lambda args: args['w1'] is not None,
+    'HAS_BIAS1': lambda args: args['b1'] is not None,
+    'HAS_WEIGHT2': lambda args: args['w2'] is not None,
+    'HAS_BIAS2': lambda args: args['b2'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -39,8 +41,10 @@ def multi_input_layer_norm_gated_fwd_kernel(
         g,  # pointer to the gate
         y,  # pointer to the output
         x_weights_after_norm, # pointer to the output norm,
-        w,  # pointer to the weights
-        b,  # pointer to the biases
+        w1,  # pointer to the weights1
+        w2,  # pointer to the weights2
+        b1,  # pointer to the biases 1
+        b2,  # pointer to the biases 2
         residual,  # pointer to the residual
         residual_out1,  # pointer to the first residual
         residual_out2,  # pointer to the second residual
@@ -59,8 +63,10 @@ def multi_input_layer_norm_gated_fwd_kernel(
         STORE_RESIDUAL_OUT: tl.constexpr,
         HAS_X_WEIGHTS: tl.constexpr,
         HAS_RESIDUAL: tl.constexpr,
-        HAS_WEIGHT: tl.constexpr,
-        HAS_BIAS: tl.constexpr
+        HAS_WEIGHT1: tl.constexpr,
+        HAS_BIAS1: tl.constexpr,
+        HAS_WEIGHT2: tl.constexpr,
+        HAS_BIAS2: tl.constexpr,
 ):
     i_t = tl.program_id(0)
 
@@ -122,19 +128,44 @@ def multi_input_layer_norm_gated_fwd_kernel(
     p_rstd2 = tl.make_block_ptr(rstd2, (T,), (1,), (i_t * BT,), (BT,), (0,))
     tl.store(p_rstd2, b_rstd2.to(p_rstd2.dtype.element_ty), boundary_check=(0,))
 
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
+    if HAS_WEIGHT1:
+        b_w1 = tl.load(w1 + o_d, mask=m_d).to(tl.float32)
+    if HAS_WEIGHT2:
+        b_w2 = tl.load(w2 + o_d, mask=m_d).to(tl.float32)
+    if HAS_BIAS1:
+        b_b1 = tl.load(b1 + o_d, mask=m_d).to(tl.float32)
+    if HAS_BIAS2:
+        b_b2 = tl.load(b2 + o_d, mask=m_d).to(tl.float32)
+
     b_x1_hat = (b_x1 - b_mean1[:, None]) * b_rstd1[:, None] if not IS_RMS_NORM else b_x1 * b_rstd1[:, None]
     b_x2_hat = (b_x2 - b_mean2[:, None]) * b_rstd2[:, None] if not IS_RMS_NORM else b_x2 * b_rstd2[:, None]
-    if HAS_X_WEIGHTS:
-        b_x_hat = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
+    # if we only have one set of weights, then they are first added and then
+    HAS_ONLY_WEIGHT1 = HAS_WEIGHT1 and not HAS_WEIGHT2
+    HAS_BOTH_WEIGHTS = HAS_WEIGHT1 and HAS_WEIGHT2
+    if HAS_ONLY_WEIGHT1:
+        if HAS_X_WEIGHTS:
+            b_x_hat = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
+        else:
+            b_x_hat = (b_x1_hat + b_x2_hat)
+        b_y = b_x_hat * b_w1[None, :] if HAS_WEIGHT1 else b_x_hat
+        if HAS_BIAS1:
+            b_y = b_y + b_b1[None, :]
+    elif HAS_BOTH_WEIGHTS:
+        b_x1_hat = b_x1_hat * b_w1[None, :]
+        b_x2_hat = b_x2_hat * b_w2[None, :]
+        if HAS_BIAS1:
+            b_x1_hat = b_x1_hat + b_b1[None, :]
+        if HAS_BIAS2:
+            b_x2_hat = b_x2_hat + b_b2[None, :]
+        if HAS_X_WEIGHTS:
+            b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
     else:
-        b_x_hat = (b_x1_hat + b_x2_hat)
-    b_y = b_x_hat * b_w[None, :] if HAS_WEIGHT else b_x_hat
-    if HAS_BIAS:
-        b_y = b_y + b_b[None, :]
+        # we set by default that if weight1 does not exist, weights2 will be ignored
+        if HAS_BIAS1:
+            b_x1_hat = b_x1_hat + b_b1[None, :]
+        if HAS_BIAS2:
+            b_x2_hat = b_x2_hat + b_b2[None, :]
+        b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w if HAS_X_WEIGHTS else b_x1_hat + b_x2_hat
 
     # swish/sigmoid output gate
     p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
@@ -155,8 +186,10 @@ def multi_input_layer_norm_gated_fwd_kernel(
     'HAS_X_WEIGHTS': lambda args: args['x_weights_after_norm'] is not None,
     'STORE_RESIDUAL_OUT': lambda args: args['residual_out1'] is not None,
     'HAS_RESIDUAL': lambda args: args['residual'] is not None,
-    'HAS_WEIGHT': lambda args: args['w'] is not None,
-    'HAS_BIAS': lambda args: args['b'] is not None,
+    'HAS_WEIGHT1': lambda args: args['w1'] is not None,
+    'HAS_BIAS1': lambda args: args['b1'] is not None,
+    'HAS_WEIGHT2': lambda args: args['w2'] is not None,
+    'HAS_BIAS2': lambda args: args['b2'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -173,8 +206,10 @@ def multi_input_layer_norm_gated_fwd_kernel1(
         g,  # pointer to the gate
         y,  # pointer to the output
         x_weights_after_norm,  # pointer to the output norm,
-        w,  # pointer to the weights
-        b,  # pointer to the biases
+        w1,  # pointer to the first weights
+        b1,  # pointer to the first biases
+        w2,  # pointer to the second weights
+        b2,  # pointer to the second biases
         residual,  # pointer to the residual
         residual_out1,  # pointer to the residual
         residual_out2,  # pointer to the second residual
@@ -190,8 +225,10 @@ def multi_input_layer_norm_gated_fwd_kernel1(
         STORE_RESIDUAL_OUT: tl.constexpr,
         HAS_X_WEIGHTS: tl.constexpr,
         HAS_RESIDUAL: tl.constexpr,
-        HAS_WEIGHT: tl.constexpr,
-        HAS_BIAS: tl.constexpr
+        HAS_WEIGHT1: tl.constexpr,
+        HAS_BIAS1: tl.constexpr,
+        HAS_WEIGHT2: tl.constexpr,
+        HAS_BIAS2: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     x1 += i_t * D
@@ -242,19 +279,44 @@ def multi_input_layer_norm_gated_fwd_kernel1(
     b_rstd2 = 1 / tl.sqrt(b_var2 + eps)
     tl.store(rstd2 + i_t, b_rstd2)
 
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
-    b_x_hat1 = (b_x1 - b_mean1) * b_rstd1 if not IS_RMS_NORM else b_x1 * b_rstd1
-    b_x_hat2 = (b_x2 - b_mean2) * b_rstd2 if not IS_RMS_NORM else b_x2 * b_rstd2
-    if HAS_X_WEIGHTS:
-        b_x_hat = b_x_hat1 * b_x1_w + b_x_hat2 * b_x2_w
+    if HAS_WEIGHT1:
+        b_w1 = tl.load(w1 + o_d, mask=m_d).to(tl.float32)
+    if HAS_WEIGHT2:
+        b_w2 = tl.load(w2 + o_d, mask=m_d).to(tl.float32)
+    if HAS_BIAS1:
+        b_b1 = tl.load(b1 + o_d, mask=m_d).to(tl.float32)
+    if HAS_BIAS2:
+        b_b2 = tl.load(b2 + o_d, mask=m_d).to(tl.float32)
+
+    b_x1_hat = (b_x1 - b_mean1) * b_rstd1 if not IS_RMS_NORM else b_x1 * b_rstd1
+    b_x2_hat = (b_x2 - b_mean2) * b_rstd2 if not IS_RMS_NORM else b_x2 * b_rstd2
+    HAS_ONLY_WEIGHT1 = HAS_WEIGHT1 and not HAS_WEIGHT2
+    HAS_BOTH_WEIGHTS = HAS_WEIGHT1 and HAS_WEIGHT2
+
+    if HAS_ONLY_WEIGHT1:
+        if HAS_X_WEIGHTS:
+            b_x_hat = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
+        else:
+            b_x_hat = (b_x1_hat + b_x2_hat)
+        b_y = b_x_hat * b_w1 if HAS_WEIGHT1 else b_x_hat
+        if HAS_BIAS1:
+            b_y = b_y + b_b1
+    elif HAS_BOTH_WEIGHTS:
+        b_x1_hat = b_x1_hat * b_w1
+        b_x2_hat = b_x2_hat * b_w2
+        if HAS_BIAS1:
+            b_x1_hat = b_x1_hat + b_b1
+        if HAS_BIAS2:
+            b_x2_hat = b_x2_hat + b_b2
+        if HAS_X_WEIGHTS:
+            b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
     else:
-        b_x_hat = b_x_hat1 + b_x_hat2
-    b_y = b_x_hat * b_w if HAS_WEIGHT else b_x_hat
-    if HAS_BIAS:
-        b_y = b_y + b_b
+        # we set by default that if weight1 does not exist, weights2 will be ignored
+        if HAS_BIAS1:
+            b_x1_hat = b_x1_hat + b_b1
+        if HAS_BIAS2:
+            b_x2_hat = b_x2_hat + b_b2
+        b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w if HAS_X_WEIGHTS else b_x1_hat + b_x2_hat
 
     # swish/sigmoid output gate
     b_g = tl.load(g + o_d, mask=m_d, other=0.0).to(tl.float32)
@@ -272,8 +334,10 @@ def multi_input_layer_norm_gated_fwd_kernel1(
 @triton.heuristics({
     'HAS_X_WEIGHTS': lambda args: args['x_weights_after_norm'] is not None,
     'HAS_DRESIDUAL': lambda args: args['dresidual1'] is not None,
-    'HAS_WEIGHT': lambda args: args['w'] is not None,
-    'HAS_BIAS': lambda args: args['b'] is not None,
+    'HAS_WEIGHT1': lambda args: args['w1'] is not None,
+    'HAS_WEIGHT2': lambda args: args['w2'] is not None,
+    'HAS_BIAS1': lambda args: args['b1'] is not None,
+    'HAS_BIAS2': lambda args: args['b2'] is not None,
     'RECOMPUTE_OUTPUT': lambda args: args['y'] is not None
 })
 @triton.autotune(
@@ -291,16 +355,20 @@ def multi_input_layer_norm_gated_bwd_kernel(
         x2,  # pointer to the second input
         g,  # pointer to the gate
         x_weights_after_norm, # pointer to the x weights after norm
-        w,  # pointer to the weights
-        b,  # pointer to the biases
+        w1,  # pointer to the weights
+        b1,  # pointer to the biases
+        w2,  # pointer to the weights
+        b2,  # pointer to the biases
         y,  # pointer to the output to be recomputed
         dy,  # pointer to the output gradient
         dx1,  # pointer to the first input gradient
         dx2,  # pointer to the second input gradient
         dg,  # pointer to the gate gradient
         d_xw,  # pointer to the weights for x after normalization
-        dw,  # pointer to the partial sum of weights gradient
-        db,  # pointer to the partial sum of biases gradient
+        dw1,  # pointer to the partial sum of weights gradient
+        dw2, # pointer to the weights for x2 after normalization
+        db1,  # pointer to the partial sum of biases gradient
+        db2, # pointer to the partial sum of biases gradient
         dresidual1,
         dresidual2,
         dresidual_in,
@@ -319,21 +387,33 @@ def multi_input_layer_norm_gated_bwd_kernel(
         STORE_DRESIDUAL: tl.constexpr,
         HAS_X_WEIGHTS: tl.constexpr,
         HAS_DRESIDUAL: tl.constexpr,
-        HAS_WEIGHT: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
+        HAS_WEIGHT1: tl.constexpr,
+        HAS_BIAS1: tl.constexpr,
+        HAS_WEIGHT2: tl.constexpr,
+        HAS_BIAS2: tl.constexpr,
         RECOMPUTE_OUTPUT: tl.constexpr,
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
     m_d = o_d < D
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
-        b_dw = tl.zeros((BT, BD), dtype=tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=m_d, other=0.0).to(tl.float32)
-        b_db = tl.zeros((BT, BD), dtype=tl.float32)
+    if HAS_WEIGHT1:
+        b_w1 = tl.load(w1 + o_d, mask=m_d).to(tl.float32)
+        b_dw1 = tl.zeros((BT, BD), dtype=tl.float32)
+    if HAS_WEIGHT2:
+        b_w2 = tl.load(w2 + o_d, mask=m_d).to(tl.float32)
+        b_dw2 = tl.zeros((BT, BD), dtype=tl.float32)
+    if HAS_BIAS1:
+        b_b1 = tl.load(b1 + o_d, mask=m_d, other=0.0).to(tl.float32)
+        b_db1 = tl.zeros((BT, BD), dtype=tl.float32)
+    if HAS_BIAS2:
+        b_b2 = tl.load(b2 + o_d, mask=m_d, other=0.0).to(tl.float32)
+        b_db2 = tl.zeros((BT, BD), dtype=tl.float32)
 
     T = min(i_s * BS + BS, T)
+
+    HAS_ONLY_WEIGHT1 = HAS_WEIGHT1 and not HAS_WEIGHT2
+    HAS_BOTH_WEIGHTS = HAS_WEIGHT1 and HAS_WEIGHT2
+
     for i_t in range(i_s * BS, T, BT):
         p_x1 = tl.make_block_ptr(x1, (T, D), (D, 1), (i_t, 0), (BT, BD), (1, 0))
         p_x2 = tl.make_block_ptr(x2, (T, D), (D, 1), (i_t, 0), (BT, BD), (1,0))
@@ -354,8 +434,8 @@ def multi_input_layer_norm_gated_bwd_kernel(
             p_x1_wn = tl.make_block_ptr(x_weights_after_norm, (T, 2), (2, 1), (i_t, 0), (BT, 1), (1,0))
             p_x2_wn = tl.make_block_ptr(x_weights_after_norm, (T, 2), (2, 1), (i_t, 1), (BT, 1), (1,0))
 
-            b_x1_weights_after_norm = tl.load(p_x1_wn, boundary_check=(0,1)).to(tl.float32)
-            b_x2_weights_after_norm = tl.load(p_x2_wn, boundary_check=(0,1)).to(tl.float32)
+            b_x1_w = tl.load(p_x1_wn, boundary_check=(0,1)).to(tl.float32)
+            b_x2_w = tl.load(p_x2_wn, boundary_check=(0,1)).to(tl.float32)
 
         if not IS_RMS_NORM:
             p_mean1 = tl.make_block_ptr(mean1, (T,), (1,), (i_t,), (BT,), (0,))
@@ -367,14 +447,15 @@ def multi_input_layer_norm_gated_bwd_kernel(
         p_rstd1 = tl.make_block_ptr(rstd1, (T,), (1,), (i_t,), (BT,), (0,))
         b_rstd1 = tl.load(p_rstd1, boundary_check=(0,))
         # Compute dx
-        b_xhat1 = (b_x1 - b_mean1[:, None]) * b_rstd1[:, None] if not IS_RMS_NORM else b_x1 * b_rstd1[:, None]
-        b_xhat1 = tl.where(m_d[None, :], b_xhat1, 0.0)
+        b_x1_hat = (b_x1 - b_mean1[:, None]) * b_rstd1[:, None] if not IS_RMS_NORM else b_x1 * b_rstd1[:, None]
+        b_x1_hat = tl.where(m_d[None, :], b_x1_hat, 0.0)
 
         p_rstd2 = tl.make_block_ptr(rstd2, (T,), (1,), (i_t,), (BT,), (0,))
         b_rstd2 = tl.load(p_rstd2, boundary_check=(0,))
         # Compute dx
-        b_xhat2 = (b_x2 - b_mean2[:, None]) * b_rstd2[:, None] if not IS_RMS_NORM else b_x2 * b_rstd2[:, None]
-        b_xhat2 = tl.where(m_d[None, :], b_xhat2, 0.0)
+        b_x2_hat = (b_x2 - b_mean2[:, None]) * b_rstd2[:, None] if not IS_RMS_NORM else b_x2 * b_rstd2[:, None]
+        b_x2_hat = tl.where(m_d[None, :], b_x2_hat, 0.0)
+        """
         if HAS_X_WEIGHTS:
             b_xhat = b_xhat1 * b_x1_weights_after_norm + b_xhat2 * b_x2_weights_after_norm
         else:
@@ -386,6 +467,37 @@ def multi_input_layer_norm_gated_bwd_kernel(
         if RECOMPUTE_OUTPUT:
             p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t, 0), (BT, BD), (1, 0))
             tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+        """
+        if HAS_ONLY_WEIGHT1:
+            b_x1_hat_ = b_x1_hat
+            b_x2_hat_ = b_x2_hat
+            if HAS_X_WEIGHTS:
+                b_x_hat = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
+            else:
+                b_x_hat = (b_x1_hat + b_x2_hat)
+            b_y = b_x_hat * b_w1[None, :] if HAS_WEIGHT1 else b_x_hat
+            if HAS_BIAS1:
+                b_y = b_y + b_b1[None, :]
+        elif HAS_BOTH_WEIGHTS:
+            b_x1_hat_ = b_x1_hat * b_w1[None, :]
+            b_x2_hat_ = b_x2_hat * b_w2[None, :]
+            if HAS_BIAS1:
+                b_x1_hat_ = b_x1_hat_ + b_b1[None, :]
+            if HAS_BIAS2:
+                b_x2_hat_ = b_x2_hat_ + b_b2[None, :]
+            if HAS_X_WEIGHTS:
+                b_y = b_x1_hat_ * b_x1_w + b_x2_hat_ * b_x2_w
+            else:
+                b_y = b_x1_hat_ + b_x2_hat_
+        else:
+            b_x1_hat_ = b_x1_hat
+            b_x2_hat_ = b_x2_hat
+            # we set by default that if weight1 does not exist, weights2 will be ignored
+            if HAS_BIAS1:
+                b_x1_hat = b_x1_hat + b_b1[None, :]
+            if HAS_BIAS2:
+                b_x2_hat = b_x2_hat + b_b2[None, :]
+            b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w if HAS_X_WEIGHTS else b_x1_hat + b_x2_hat
 
         b_sigmoid_g = tl.sigmoid(b_g)
         if ACTIVATION == 'swish':
@@ -399,50 +511,101 @@ def multi_input_layer_norm_gated_bwd_kernel(
             b_dy = b_dy * b_sigmoid_g
         b_wdy = b_dy
 
-        if HAS_WEIGHT or HAS_BIAS:
-            m_t = (i_t + tl.arange(0, BT)) < T
-        if HAS_WEIGHT:
-            b_wdy = b_dy * b_w
-            b_dw += tl.where(m_t[:, None], b_dy * b_xhat, 0.0)
-        if HAS_BIAS:
-            b_db += tl.where(m_t[:, None], b_dy, 0.0)
-        if not IS_RMS_NORM:
-            b_c11 = tl.sum(b_xhat1 * b_wdy, axis=1) / D
-            b_c12 = tl.sum(b_xhat2 * b_wdy, axis=1) / D
-            b_c2 = tl.sum(b_wdy, axis=1) / D
+        m_t = (i_t + tl.arange(0, BT)) < T
+        if HAS_BOTH_WEIGHTS:
+            # In this case, we have b_x_hat = (b_x1_hat * w1 * b_wx1 + b_x2_hat * w2 * b_wx2) *
             if HAS_X_WEIGHTS:
-                b_dx1 = b_x1_weights_after_norm * (b_wdy - (b_xhat1 * b_c11[:, None] + b_c2[:, None])) * b_rstd1[:, None]
-                b_dx2 = b_x2_weights_after_norm * (b_wdy - (b_xhat2 * b_c12[:, None] + b_c2[:, None])) * b_rstd2[:, None]
+                b_dy1 = b_wdy * b_x1_w
+                b_dy2 = b_wdy * b_x2_w
 
-                b_dxw1 = tl.sum(b_wdy * b_xhat1, axis=1)
-                b_dxw2 = tl.sum(b_wdy * b_xhat2, axis=1)
+                b_dxw1 = tl.sum(b_wdy * b_x1_hat_, axis=1, keep_dims=True)
+                b_dxw2 = tl.sum(b_wdy * b_x2_hat_, axis=1, keep_dims=True)
 
                 p_dx1_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 0), (BT, 1), (1, 0))
                 p_dx2_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 1), (BT, 1), (1, 0))
                 tl.store(p_dx1_wn, b_dxw1.to(p_dx1_wn.dtype.element_ty), boundary_check=(0, 1))
                 tl.store(p_dx2_wn, b_dxw2.to(p_dx2_wn.dtype.element_ty), boundary_check=(0, 1))
-            else:
-                b_dx1 = (b_wdy - (b_xhat1 * b_c11[:, None] + b_c2[:, None])) * b_rstd1[:, None]
-                b_dx2 = (b_wdy - (b_xhat2 * b_c12[:, None] + b_c2[:, None])) * b_rstd2[:, None]
 
+                if HAS_BIAS1:
+                    b_db1 += tl.where(m_t[:, None], b_dy1, 0.0)
+                    b_db2 += tl.where(m_t[:, None], b_dy2, 0.0)
+
+                b_wdy1 = b_dy1 * b_w1
+                b_wdy2 = b_dy2 * b_w2
+                if HAS_WEIGHT1:
+                    b_dw1 += tl.where(m_t[:, None], b_dy1 * b_x1_hat, 0.0)
+                    b_dw2 += tl.where(m_t[:, None], b_dy2 * b_x2_hat, 0.0)
+            else:
+                b_wdy1 = b_wdy * b_w1
+                b_wdy2 = b_wdy * b_w2
+                if HAS_BIAS1:
+                    b_db1 += tl.where(m_t[:, None], b_dy, 0.0)
+                    b_db2 += tl.where(m_t[:, None], b_dy, 0.0)
+
+                if HAS_WEIGHT1:
+                    b_dw1 += tl.where(m_t[:, None], b_dy * b_x1_hat, 0.0)
+                    b_dw2 += tl.where(m_t[:, None], b_dy * b_x2_hat, 0.0)
+
+            if not IS_RMS_NORM:
+                b_c11 = tl.sum(b_x1_hat * b_wdy1, axis=1) / D
+                b_c21 = tl.sum(b_wdy1, axis=1) / D
+                b_dx1 = (b_wdy1 - (b_x1_hat * b_c11[:, None] + b_c21[:, None])) * b_rstd1[:, None]
+
+                b_c12 = tl.sum(b_x2_hat * b_wdy2, axis=1) / D
+                b_c22 = tl.sum(b_wdy2, axis=1) / D
+                b_dx2 = (b_wdy2 - (b_x2_hat * b_c12[:, None] + b_c22[:, None])) * b_rstd2[:, None]
+            else:
+                b_c11 = tl.sum(b_x1_hat * b_wdy1, axis=1) / D
+                b_dx1 = (b_wdy1 - b_x1_hat * b_c11[:, None]) * b_rstd1[:, None]
+
+                b_c12 = tl.sum(b_x2_hat * b_wdy2, axis=1) / D
+                b_dx2 = (b_wdy2 - b_x2_hat * b_c12[:, None]) * b_rstd2[:, None]
         else:
-            b_c11 = tl.sum(b_xhat1 * b_wdy, axis=1) / D
-            b_c12 = tl.sum(b_xhat2 * b_wdy, axis=1) / D
-            if HAS_X_WEIGHTS:
-                b_dx1 = b_x1_weights_after_norm * (b_wdy - b_xhat1 * b_c11[:, None]) * b_rstd1[:, None]
-                b_dx2 = b_x2_weights_after_norm * (b_wdy - b_xhat2 * b_c12[:, None]) * b_rstd2[:, None]
+            if HAS_WEIGHT1:
+                b_wdy = b_dy * b_w1
+                b_dw1 += tl.where(m_t[:, None], b_dy * b_x1_hat, 0.0)
+            if HAS_BIAS1:
+                b_db1 += tl.where(m_t[:, None], b_dy, 0.0)
 
-                b_dxw1 = tl.sum(b_wdy * b_xhat1, axis=1, keep_dims=True)
-                b_dxw2 = tl.sum(b_wdy * b_xhat2, axis=1, keep_dims=True)
+            if not IS_RMS_NORM:
+                b_c11 = tl.sum(b_x1_hat * b_wdy, axis=1) / D
+                b_c12 = tl.sum(b_x2_hat * b_wdy, axis=1) / D
+                b_c2 = tl.sum(b_wdy, axis=1) / D
+                if HAS_X_WEIGHTS:
+                    b_dx1 = b_x1_w * (b_wdy - (b_x1_hat * b_c11[:, None] + b_c2[:, None])) * b_rstd1[:, None]
+                    b_dx2 = b_x2_w * (b_wdy - (b_x2_hat * b_c12[:, None] + b_c2[:, None])) * b_rstd2[:, None]
 
-                p_dx1_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 0), (BT, 1), (1, 0))
-                p_dx2_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 1), (BT, 1), (1, 0))
-                tl.store(p_dx1_wn, b_dxw1.to(p_dx1_wn.dtype.element_ty), boundary_check=(0, 1))
-                tl.store(p_dx2_wn, b_dxw2.to(p_dx2_wn.dtype.element_ty), boundary_check=(0, 1))
+                    b_dxw1 = tl.sum(b_wdy * b_x1_hat, axis=1)
+                    b_dxw2 = tl.sum(b_wdy * b_x2_hat, axis=1)
+
+                    p_dx1_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 0), (BT, 1), (1, 0))
+                    p_dx2_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 1), (BT, 1), (1, 0))
+                    tl.store(p_dx1_wn, b_dxw1.to(p_dx1_wn.dtype.element_ty), boundary_check=(0, 1))
+                    tl.store(p_dx2_wn, b_dxw2.to(p_dx2_wn.dtype.element_ty), boundary_check=(0, 1))
+                else:
+                    b_dx1 = (b_wdy - (b_x1_hat * b_c11[:, None] + b_c2[:, None])) * b_rstd1[:, None]
+                    b_dx2 = (b_wdy - (b_x2_hat * b_c12[:, None] + b_c2[:, None])) * b_rstd2[:, None]
 
             else:
-                b_dx1 = (b_wdy - b_xhat1 * b_c11[:, None]) * b_rstd1[:, None]
-                b_dx2 = (b_wdy - b_xhat2 * b_c12[:, None]) * b_rstd2[:, None]
+                b_c11 = tl.sum(b_x1_hat * b_wdy, axis=1) / D
+                b_c12 = tl.sum(b_x2_hat * b_wdy, axis=1) / D
+                if HAS_X_WEIGHTS:
+                    b_dx1 = b_x1_w * (b_wdy - b_x1_hat * b_c11[:, None]) * b_rstd1[:, None]
+                    b_dx2 = b_x2_w * (b_wdy - b_x2_hat * b_c12[:, None]) * b_rstd2[:, None]
+
+                    b_dxw1 = tl.sum(b_wdy * b_x1_hat, axis=1, keep_dims=True)
+                    b_dxw2 = tl.sum(b_wdy * b_x2_hat, axis=1, keep_dims=True)
+
+                    p_dx1_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 0), (BT, 1), (1, 0))
+                    p_dx2_wn = tl.make_block_ptr(d_xw, (T, 2), (2, 1), (i_t, 1), (BT, 1), (1, 0))
+                    tl.store(p_dx1_wn, b_dxw1.to(p_dx1_wn.dtype.element_ty), boundary_check=(0, 1))
+                    tl.store(p_dx2_wn, b_dxw2.to(p_dx2_wn.dtype.element_ty), boundary_check=(0, 1))
+
+                else:
+                    b_dx1 = (b_wdy - b_x1_hat * b_c11[:, None]) * b_rstd1[:, None]
+                    b_dx2 = (b_wdy - b_x2_hat * b_c12[:, None]) * b_rstd2[:, None]
+
+
 
         if HAS_DRESIDUAL:
             p_dres1 = tl.make_block_ptr(dresidual1, (T, D), (D, 1), (i_t, 0), (BT, BD), (1, 0))
@@ -463,17 +626,23 @@ def multi_input_layer_norm_gated_bwd_kernel(
 
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0, 1))
 
-    if HAS_WEIGHT:
-        tl.store(dw + i_s * D + o_d, tl.sum(b_dw, axis=0), mask=m_d)
-    if HAS_BIAS:
-        tl.store(db + i_s * D + o_d, tl.sum(b_db, axis=0), mask=m_d)
+    if HAS_WEIGHT1:
+        tl.store(dw1 + i_s * D + o_d, tl.sum(b_dw1, axis=0), mask=m_d)
+    if HAS_BIAS1:
+        tl.store(db1 + i_s * D + o_d, tl.sum(b_db1, axis=0), mask=m_d)
+    if HAS_WEIGHT2:
+        tl.store(dw2 + i_s * D + o_d, tl.sum(b_dw2, axis=0), mask=m_d)
+    if HAS_BIAS2:
+        tl.store(db2 + i_s * D + o_d, tl.sum(b_db2, axis=0), mask=m_d)
 
 
 @triton.heuristics({
     'HAS_X_WEIGHTS': lambda args: args['x_weights_after_norm'] is not None,
     'HAS_DRESIDUAL': lambda args: args['dresidual'] is not None,
-    'HAS_WEIGHT': lambda args: args['w'] is not None,
-    'HAS_BIAS': lambda args: args['b'] is not None,
+    'HAS_WEIGHT1': lambda args: args['w1'] is not None,
+    'HAS_WEIGHT2': lambda args: args['w2'] is not None,
+    'HAS_BIAS1': lambda args: args['b1'] is not None,
+    'HAS_BIAS2': lambda args: args['b2'] is not None,
     'RECOMPUTE_OUTPUT': lambda args: args['y'] is not None
 })
 @triton.autotune(
@@ -490,16 +659,20 @@ def multi_input_layer_norm_gated_bwd_kernel1(
         x2,  # pointer to the second input
         g,  # pointer to the gate
         x_weights_after_norm,  # pointer to the x weights after norm
-        w,  # pointer to the weights
-        b,  # pointer to the biases
+        w1,  # pointer to the weights
+        b1,  # pointer to the biases
+        w2,  # pointer to the weights
+        b2,  # pointer to the biases
         y,  # pointer to the output to be recomputed
         dy,  # pointer to the output gradient
         dx1,  # pointer to the first input gradient
         dx2,  # pointer to the second input gradient
         dg,  # pointer to the gate gradient
         d_xw,  # pointer to the weights for x after normalization
-        dw,  # pointer to the partial sum of weights gradient
-        db,  # pointer to the partial sum of biases gradient
+        dw1,  # pointer to the partial sum of weights gradient
+        dw2, # pointer to the weights for x2 after normalization
+        db1,  # pointer to the partial sum of biases gradient
+        db2, # pointer to the partial sum of biases gradient
         dresidual1,
         dresidual2,
         dresidual_in,
@@ -516,8 +689,10 @@ def multi_input_layer_norm_gated_bwd_kernel1(
         STORE_DRESIDUAL: tl.constexpr,
         HAS_X_WEIGHTS: tl.constexpr,
         HAS_DRESIDUAL: tl.constexpr,
-        HAS_WEIGHT: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
+        HAS_WEIGHT1: tl.constexpr,
+        HAS_BIAS1: tl.constexpr,
+        HAS_WEIGHT2: tl.constexpr,
+        HAS_BIAS2: tl.constexpr,
         RECOMPUTE_OUTPUT: tl.constexpr,
 ):
     i_s = tl.program_id(0)
@@ -541,12 +716,22 @@ def multi_input_layer_norm_gated_bwd_kernel1(
     if HAS_X_WEIGHTS:
         x_weights_after_norm += i_s * BS * 2
         d_xw += i_s * BS * 2
-    if HAS_WEIGHT:
-        b_w = tl.load(w + o_d, mask=mask).to(tl.float32)
-        b_dw = tl.zeros((BD,), dtype=tl.float32)
-    if HAS_BIAS:
-        b_b = tl.load(b + o_d, mask=mask, other=0.0).to(tl.float32)
-        b_db = tl.zeros((BD,), dtype=tl.float32)
+    if HAS_WEIGHT1:
+        b_w1 = tl.load(w1 + o_d, mask=mask).to(tl.float32)
+        b_dw1 = tl.zeros((BD,), dtype=tl.float32)
+    if HAS_WEIGHT2:
+        b_w2 = tl.load(w2 + o_d, mask=mask).to(tl.float32)
+        b_dw2 = tl.zeros((BD,), dtype=tl.float32)
+
+    if HAS_BIAS1:
+        b_b1 = tl.load(b1 + o_d, mask=mask, other=0.0).to(tl.float32)
+        b_db1 = tl.zeros((BD,), dtype=tl.float32)
+    if HAS_BIAS2:
+        b_b2 = tl.load(b2 + o_d, mask=mask, other=0.0).to(tl.float32)
+        b_db2 = tl.zeros((BD,), dtype=tl.float32)
+
+    HAS_ONLY_WEIGHT1 = HAS_WEIGHT1 and not HAS_WEIGHT2
+    HAS_BOTH_WEIGHTS = HAS_WEIGHT1 and HAS_WEIGHT2
 
     for i_t in range(i_s * BS, min(i_s * BS + BS, T)):
         # Load data to SRAM
@@ -570,16 +755,40 @@ def multi_input_layer_norm_gated_bwd_kernel1(
         b_xhat2 = tl.where(mask, b_xhat2, 0.0)
 
         if HAS_X_WEIGHTS:
-            b_x1_weights_after_norm= tl.load(x_weights_after_norm + i_t * 2).to(tl.float32)
-            b_x2_weights_after_norm = tl.load(x_weights_after_norm + i_t * 2 + 1).to(tl.float32)
+            b_x1_w = tl.load(x_weights_after_norm + i_t * 2).to(tl.float32)
+            b_x2_w = tl.load(x_weights_after_norm + i_t * 2 + 1).to(tl.float32)
 
-            b_xhat = b_xhat1 * b_x1_weights_after_norm + b_xhat2 * b_x2_weights_after_norm
+        if HAS_ONLY_WEIGHT1:
+            b_x1_hat_ = b_x1_hat
+            b_x2_hat_ = b_x2_hat
+            if HAS_X_WEIGHTS:
+                b_x_hat = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w
+            else:
+                b_x_hat = (b_x1_hat + b_x2_hat)
+            b_y = b_x_hat * b_w1[None, :] if HAS_WEIGHT1 else b_x_hat
+            if HAS_BIAS1:
+                b_y = b_y + b_b1[None, :]
+        elif HAS_BOTH_WEIGHTS:
+            b_x1_hat_ = b_x1_hat * b_w1[None, :]
+            b_x2_hat_ = b_x2_hat * b_w2[None, :]
+            if HAS_BIAS1:
+                b_x1_hat_ = b_x1_hat_ + b_b1[None, :]
+            if HAS_BIAS2:
+                b_x2_hat_ = b_x2_hat_ + b_b2[None, :]
+            if HAS_X_WEIGHTS:
+                b_y = b_x1_hat_ * b_x1_w + b_x2_hat_ * b_x2_w
+            else:
+                b_y = b_x1_hat_ + b_x2_hat_
         else:
-            b_xhat = b_xhat1 + b_xhat2
+            b_x1_hat_ = b_x1_hat
+            b_x2_hat_ = b_x2_hat
+            # we set by default that if weight1 does not exist, weights2 will be ignored
+            if HAS_BIAS1:
+                b_x1_hat = b_x1_hat + b_b1[None, :]
+            if HAS_BIAS2:
+                b_x2_hat = b_x2_hat + b_b2[None, :]
+            b_y = b_x1_hat * b_x1_w + b_x2_hat * b_x2_w if HAS_X_WEIGHTS else b_x1_hat + b_x2_hat
 
-        b_y = b_xhat * b_w if HAS_WEIGHT else b_xhat
-        if HAS_BIAS:
-            b_y = b_y + b_b
         if RECOMPUTE_OUTPUT:
             tl.store(y + o_d, b_y, mask=mask)
 
@@ -593,6 +802,8 @@ def multi_input_layer_norm_gated_bwd_kernel1(
         elif ACTIVATION == 'sigmoid':
             b_dg = b_dy * b_y * b_sigmoid_g * (1 - b_sigmoid_g)
             b_dy = b_dy * b_sigmoid_g
+
+
         b_wdy = b_dy
         if HAS_WEIGHT:
             b_wdy = b_dy * b_w
@@ -633,6 +844,91 @@ def multi_input_layer_norm_gated_bwd_kernel1(
                 b_dx1 = (b_wdy - b_xhat1 * b_c11) * b_rstd1
                 b_dx2 = (b_wdy - b_xhat2 * b_c12) * b_rstd2
 
+        if HAS_BOTH_WEIGHTS:
+            # In this case, we have b_x_hat = (b_x1_hat * w1 * b_wx1 + b_x2_hat * w2 * b_wx2) *
+            if HAS_X_WEIGHTS:
+                b_dy1 = b_wdy * b_x1_w
+                b_dy2 = b_wdy * b_x2_w
+
+                b_dxw1 = tl.sum(b_wdy * b_x1_hat_, )
+                b_dxw2 = tl.sum(b_wdy * b_x2_hat_, )
+                tl.store(d_xw + i_t * 2, b_dxw1.to(d_xw.dtype.element_ty))
+                tl.store(d_xw + i_t * 2 + 1, b_dxw2.to(d_xw.dtype.element_ty))
+
+                if HAS_BIAS1:
+                    b_db1 += b_dy1
+                    b_db2 += b_dy2
+
+                b_wdy1 = b_dy1 * b_w1
+                b_wdy2 = b_dy2 * b_w2
+                if HAS_WEIGHT1:
+                    b_dw1 += b_dy1 * b_x1_hat
+                    b_dw2 += b_dy2 * b_x2_hat
+            else:
+                b_wdy1 = b_wdy * b_w1
+                b_wdy2 = b_wdy * b_w2
+                if HAS_BIAS1:
+                    b_db1 += b_dy
+                    b_db2 += b_dy
+
+                if HAS_WEIGHT1:
+                    b_dw1 += b_dy * b_x1_hat
+                    b_dw2 += b_dy * b_x2_hat
+
+            if not IS_RMS_NORM:
+                b_c11 = tl.sum(b_x1_hat * b_wdy1, axis=0) / D
+                b_c21 = tl.sum(b_wdy1, axis=0) / D
+                b_dx1 = (b_wdy1 - (b_x1_hat * b_c11 + b_c21)) * b_rstd1
+
+                b_c12 = tl.sum(b_x2_hat * b_wdy2, axis=0) / D
+                b_c22 = tl.sum(b_wdy2, axis=0) / D
+                b_dx2 = (b_wdy2 - (b_x2_hat * b_c12 + b_c22)) * b_rstd2
+            else:
+                b_c11 = tl.sum(b_x1_hat * b_wdy1, axis=0) / D
+                b_dx1 = (b_wdy1 - b_x1_hat * b_c11) * b_rstd1
+
+                b_c12 = tl.sum(b_x2_hat * b_wdy2, axis=0) / D
+                b_dx2 = (b_wdy2 - b_x2_hat * b_c12) * b_rstd2
+        else:
+            if HAS_WEIGHT1:
+                b_wdy = b_dy * b_w1
+                b_dw1 +=  b_dy * b_x1_hat
+            if HAS_BIAS1:
+                b_db1 += b_dy
+
+            if not IS_RMS_NORM:
+                b_c11 = tl.sum(b_x1_hat * b_wdy, axis=0) / D
+                b_c12 = tl.sum(b_x2_hat * b_wdy, axis=0) / D
+                b_c2 = tl.sum(b_wdy, axis=0) / D
+                if HAS_X_WEIGHTS:
+                    b_dx1 = b_x1_w * (b_wdy - (b_x1_hat * b_c11 + b_c2)) * b_rstd1
+                    b_dx2 = b_x2_w * (b_wdy - (b_x2_hat * b_c12 + b_c2)) * b_rstd2
+
+                    b_dxw1 = tl.sum(b_wdy * b_x1_hat, axis=1)
+                    b_dxw2 = tl.sum(b_wdy * b_x2_hat, axis=1)
+
+                    tl.store(d_xw + i_t * 2, b_dxw1.to(d_xw.dtype.element_ty))
+                    tl.store(d_xw + i_t * 2 + 1, b_dxw2.to(d_xw.dtype.element_ty))
+                else:
+                    b_dx1 = (b_wdy - (b_x1_hat * b_c11 + b_c2)) * b_rstd1
+                    b_dx2 = (b_wdy - (b_x2_hat * b_c12 + b_c2)) * b_rstd2
+
+            else:
+                b_c11 = tl.sum(b_x1_hat * b_wdy, axis=0) / D
+                b_c12 = tl.sum(b_x2_hat * b_wdy, axis=0) / D
+                if HAS_X_WEIGHTS:
+                    b_dx1 = b_x1_w * (b_wdy - b_x1_hat * b_c11) * b_rstd1
+                    b_dx2 = b_x2_w * (b_wdy - b_x2_hat * b_c12) * b_rstd2
+
+                    b_dxw1 = tl.sum(b_wdy * b_x1_hat,  )
+                    b_dxw2 = tl.sum(b_wdy * b_x2_hat, )
+
+                    tl.store(d_xw + i_t * 2, b_dxw1.to(d_xw.dtype.element_ty))
+                    tl.store(d_xw + i_t * 2 + 1, b_dxw2.to(d_xw.dtype.element_ty))
+                else:
+                    b_dx1 = (b_wdy - b_x1_hat * b_c11[:, None]) * b_rstd1[:, None]
+                    b_dx2 = (b_wdy - b_x2_hat * b_c12[:, None]) * b_rstd2[:, None]
+
         if HAS_DRESIDUAL:
             b_dres1 = tl.load(dresidual1 + o_d, mask=mask, other=0).to(tl.float32)
             b_dx1 += b_dres1
@@ -671,8 +967,10 @@ def multi_input_layer_norm_gated_fwd(
         x: tuple[torch.Tensor],
         g: torch.Tensor,
         x_weights_after_norm: Optional[torch.Tensor],
-        weight: torch.Tensor,
-        bias: torch.Tensor,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        bias1: torch.Tensor,
+        bias2:torch.Tensor,
         activation: str = 'swish',
         eps: float = 1e-5,
         residual: torch.Tensor = None,
@@ -686,10 +984,14 @@ def multi_input_layer_norm_gated_fwd(
     T, D = x0.shape
     if residual is not None:
         assert residual.shape == (T, D)
-    if weight is not None:
-        assert weight.shape == (D,)
-    if bias is not None:
-        assert bias.shape == (D,)
+    if weight1 is not None:
+        assert weight1.shape == (D,)
+    if weight2 is not None:
+        assert weight2.shape == (D,)
+    if bias1 is not None:
+        assert bias1.shape == (D,)
+    if bias2 is not None:
+        assert bias2.shape == (D,)
     # allocate output
     y = torch.empty_like(x0, dtype=x0.dtype if out_dtype is None else out_dtype)
     if residual is not None or (residual_dtype is not None and residual_dtype != x0.dtype):
@@ -717,8 +1019,10 @@ def multi_input_layer_norm_gated_fwd(
             g=g,
             y=y,
             x_weights_after_norm=x_weights_after_norm,
-            w=weight,
-            b=bias,
+            w1=weight1,
+            b1=bias1,
+            w2=weight2,
+            b2=bias2,
             residual=residual,
             residual_out1=residual_out[0] if residual_out is not None else None,
             residual_out2=residual_out[1] if residual_out is not None else None,
@@ -741,8 +1045,10 @@ def multi_input_layer_norm_gated_fwd(
             g=g,
             y=y,
             x_weights_after_norm=x_weights_after_norm,
-            w=weight,
-            b=bias,
+            w1=weight1,
+            b1=bias1,
+            w2=weight2,
+            b2=bias2,
             residual=residual,
             residual_out1=residual_out[0],
             residual_out2=residual_out[1],
@@ -765,8 +1071,10 @@ def multi_input_layer_norm_gated_bwd(
         x: tuple[torch.Tensor],
         g: torch.Tensor,
         x_weights_after_norm: Optional[torch.Tensor],
-        weight: torch.Tensor,
-        bias: torch.Tensor,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        bias1: torch.Tensor,
+        bias2: torch.Tensor,
         activation: str = 'swish',
         eps: float = 1e-5,
         mean: tuple[torch.Tensor] = None,
@@ -782,10 +1090,14 @@ def multi_input_layer_norm_gated_bwd(
     assert dy.shape == (T, D)
     if dresidual is not None:
         assert dresidual[0].shape == (T, D)
-    if weight is not None:
-        assert weight.shape == (D,)
-    if bias is not None:
-        assert bias.shape == (D,)
+    if weight1 is not None:
+        assert weight1.shape == (D,)
+    if weight2 is not None:
+        assert weight2.shape == (D,)
+    if bias1 is not None:
+        assert bias1.shape == (D,)
+    if bias2 is not None:
+        assert bias2.shape == (D,)
     # allocate output
     dx = tuple(torch.empty_like(x0) if x_dtype is None else torch.empty(T, D, dtype=x_dtype, device=x0.device) for _ in range(len(x)))
     dg = torch.empty_like(g) if x_dtype is None else torch.empty(T, D, dtype=x_dtype, device=x0.device)
@@ -805,8 +1117,10 @@ def multi_input_layer_norm_gated_bwd(
     NS = get_multiprocessor_count(x0.device.index)
     BS = math.ceil(T / NS)
 
-    dw = torch.empty((NS, D), dtype=torch.float, device=weight.device) if weight is not None else None
-    db = torch.empty((NS, D), dtype=torch.float, device=bias.device) if bias is not None else None
+    dw1 = torch.empty((NS, D), dtype=torch.float, device=weight1.device) if weight1 is not None else None
+    dw2 = torch.empty((NS, D), dtype=torch.float, device=weight2.device) if weight2 is not None else None
+    db1 = torch.empty((NS, D), dtype=torch.float, device=bias1.device) if bias1 is not None else None
+    db2 = torch.empty((NS, D), dtype=torch.float, device=bias2.device) if bias2 is not None else None
     grid = (NS,)
 
     if D <= 512:
@@ -816,16 +1130,20 @@ def multi_input_layer_norm_gated_bwd(
             x2=x[1],
             g=g,
             x_weights_after_norm=x_weights_after_norm,
-            w=weight,
-            b=bias,
+            w1=weight1,
+            w2=weight2,
+            b1=bias1,
+            b2=bias2,
             y=y,
             dy=dy,
             dx1=dx[0],
             dx2=dx[1],
             dg=dg,
             d_xw=d_xw,
-            dw=dw,
-            db=db,
+            dw1=dw1,
+            dw2=dw2,
+            db1=db1,
+            db2=db2,
             dresidual1=dresidual[0] if dresidual is not None else None,
             dresidual2=dresidual[1] if dresidual is not None else None,
             dresidual_in=dresidual_in,
@@ -848,16 +1166,19 @@ def multi_input_layer_norm_gated_bwd(
             x2=x[1],
             g=g,
             x_weights_after_norm=x_weights_after_norm,
-            w=weight,
-            b=bias,
+            w1=weight1,
+            w2=weight2,
+            b1=bias1,
+            b2=bias2,
             y=y,
             dy=dy,
             dx1=dx[0],
             dx2=dx[1],
             dxw=d_xw,
-            dg=dg,
-            dw=dw,
-            db=db,
+            dw1=dw1,
+            dw2=dw2,
+            db1=db1,
+            db2=db2,
             dresidual1=dresidual[0] if dresidual is not None else None,
             dresidual2=dresidual[1] if dresidual is not None else None,
             dresidual_in=dresidual_in,
@@ -873,12 +1194,14 @@ def multi_input_layer_norm_gated_bwd(
             IS_RMS_NORM=is_rms_norm,
             STORE_DRESIDUAL=dresidual_in is not None,
         )
-    dw = dw.sum(0).to(weight.dtype) if weight is not None else None
-    db = db.sum(0).to(bias.dtype) if bias is not None else None
+    dw1 = dw1.sum(0).to(weight1.dtype) if weight1 is not None else None
+    dw2 = dw2.sum(0).to(weight2.dtype) if weight2 is not None else None
+    db1 = db1.sum(0).to(bias1.dtype) if bias1 is not None else None
+    db2 = db2.sum(0).to(bias2.dtype) if bias2 is not None else None
     # Don't need to compute dresidual_in separately in this case
     if has_residual and dx.dtype == x.dtype:
         dresidual_in = dx
-    return (dx, dg, d_xw, dw, db, dresidual_in) if not recompute_output else (dx, dg, d_xw, dw, db, dresidual_in, y)
+    return (dx, dg, d_xw, dw1, dw2, db1, db2, dresidual_in) if not recompute_output else (dx, dg, d_xw, dw1, dw2, db1, db2, dresidual_in, y)
 
 
 class TwoInputLayerNormGatedFunction(torch.autograd.Function):
@@ -890,8 +1213,10 @@ class TwoInputLayerNormGatedFunction(torch.autograd.Function):
             x2: torch.Tensor,
             g: torch.Tensor,
             x_weights_after_norm: torch.Tensor,
-            weight: torch.Tensor,
-            bias: torch.Tensor,
+            weight1: torch.Tensor,
+            weight2: torch.Tensor,
+            bias1: torch.Tensor,
+            bias2: torch.Tensor,
             activation: str,
             residual: Optional[torch.Tensor] = None,
             eps: float = 1e-6,
@@ -919,18 +1244,18 @@ class TwoInputLayerNormGatedFunction(torch.autograd.Function):
             x=(x1.reshape(-1, x1.shape[-1]), x2.reshape(-1, x1.shape[-1])),
             x_weights_after_norm=x_weights_after_norm,
             g=g,
-            weight=weight,
-            bias=bias,
+            weight1=weight1,
+            weight2=weight2,
+            bias1=bias1,
+            bias2=bias2,
             activation=activation,
             eps=eps,
             residual=residual,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm
         )
-        import pdb
-        pdb.set_trace()
         ctx.save_for_backward(residual_out[0], residual_out[1], g, x_weights_after_norm,
-                              weight, bias,
+                              weight1, bias1, weight2, bias2,
                               mean[0] if mean is not None else None,
                               mean[1] if mean is not None else None,
                               rstd[0], rstd[1])
@@ -948,7 +1273,7 @@ class TwoInputLayerNormGatedFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     def backward(ctx, dy, *args):
-        x1, x2, g, x_weights_after_norm, weight, bias, mean1, mean2, rstd1, rstd2 = ctx.saved_tensors
+        x1, x2, g, x_weights_after_norm, weight1, bias1, weight2, bias2, mean1, mean2, rstd1, rstd2 = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
         assert dy.shape == x1.shape
         if ctx.prenorm:
@@ -957,13 +1282,15 @@ class TwoInputLayerNormGatedFunction(torch.autograd.Function):
             assert dresidual.shape == x1.shape
         else:
             dresidual = None
-        dx, dg, dxw, dw, db, dres_in = multi_input_layer_norm_gated_bwd(
+        dx, dg, dxw, dw1, db1, dw2, db2, dres_in = multi_input_layer_norm_gated_bwd(
             dy=dy,
             x=(x1,x2),
             g=g,
             x_weights_after_norm=x_weights_after_norm,
-            weight=weight,
-            bias=bias,
+            weight1=weight1,
+            weight2=weight2,
+            bias1=bias1,
+            bias2=bias2,
             activation=ctx.activation,
             eps=ctx.eps,
             mean=(mean1, mean2),
@@ -973,15 +1300,15 @@ class TwoInputLayerNormGatedFunction(torch.autograd.Function):
             is_rms_norm=ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
         )
-        import pdb
-        pdb.set_trace()
         return (
             dx[0].reshape(ctx.x_shape_og),
             dx[1].reshape(ctx.x_shape_og),
             dg.reshape(ctx.g_shape_og),
             dxw.reshape([*ctx.x_shape_og[:-1], 2]),
-            dw,
-            db,
+            dw1,
+            db1,
+            dw2,
+            db2,
             None,
             dres_in.reshape(ctx.x_shape_og) if ctx.has_residual else None,
             None,
@@ -996,8 +1323,10 @@ def two_inputs_rms_norm_gated(
         x2: torch.Tensor,
         g: torch.Tensor,
         x_weights_after_norm: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor,
+        weight1: torch.Tensor,
+        weight2: Optional[torch.Tensor],
+        bias1: torch.Tensor,
+        bias2: Optional[torch.Tensor],
         activation: str = 'swish',
         residual: Optional[torch.Tensor] = None,
         prenorm: bool = False,
@@ -1009,8 +1338,10 @@ def two_inputs_rms_norm_gated(
         x2,
         g,
         x_weights_after_norm,
-        weight,
-        bias,
+        weight1,
+        weight2,
+        bias1,
+        bias2,
         activation,
         residual,
         eps,
@@ -1043,16 +1374,20 @@ class FusedMultiInputRMSNormGated(nn.Module):
             raise ValueError(f"Unsupported activation: {self.activation}")
 
         if elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+            self.weight1 = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+            self.weight2 = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         else:
-            self.register_parameter("weight", None)
-        self.register_parameter("bias", None)
+            self.register_parameter("weight1", None)
+            self.register_parameter("weight2", None)
+        self.register_parameter("bias1", None)
+        self.register_parameter("bias2", None)
 
         self.reset_parameters()
 
     def reset_parameters(self):
         if self.elementwise_affine:
-            nn.init.ones_(self.weight)
+            nn.init.ones_(self.weight1)
+            nn.init.ones_(self.weight2)
 
     def __repr__(self) -> str:
         s = f"{self.__class__.__name__}({self.hidden_size}"
@@ -1078,8 +1413,10 @@ class FusedMultiInputRMSNormGated(nn.Module):
             x2,
             g,
             x_weights_after_norm,
-            self.weight,
-            self.bias,
+            self.weight1,
+            self.weight2,
+            self.bias1,
+            self.bias2,
             self.activation,
             residual=residual,
             eps=self.eps,
@@ -1107,6 +1444,11 @@ if __name__ == "__main__":
 
     g1 = nn.Parameter(copy.deepcopy(g), requires_grad=True)
 
+    w1_data = torch.randn_like(norm.weight1.data)
+    w2_data = torch.randn_like(norm.weight2.data)
+    norm.weight1.data = w1_data.clone()
+    norm.weight2.data = w2_data.clone()
+
     o1 = norm(d1, d2, g1, xw1)
     loss = o1.abs().sum()
     loss.backward()
@@ -1116,10 +1458,12 @@ if __name__ == "__main__":
     g11 = nn.Parameter(copy.deepcopy(g), requires_grad=True)
     xw2 = nn.Parameter(copy.deepcopy(xw), requires_grad=True)
 
-    weight1 = nn.Parameter(torch.ones(hs, device=torch.device('cuda')), requires_grad=True)
+    weight1 = nn.Parameter(w1_data.clone(), requires_grad=True)
+    weight2 = nn.Parameter(w2_data.clone(), requires_grad=True)
     var1 = (d11*d11).sum(-1, keepdim=True)/hs
     vbar2 = (d21*d21).sum(-1, keepdim=True)/hs
-    o2 = ((d11 /torch.sqrt(var1)) * xw2[..., [0]] + (d21 / torch.sqrt(vbar2))* xw2[..., [1]] ) * weight1[None, None, :] * g11 * nn.functional.sigmoid(g11)
+    eps = 1e-5
+    o2 = ((d11 /(torch.sqrt(var1) + eps)) * weight1[None, None, :] * xw2[..., [0]] + (d21 / (torch.sqrt(vbar2) + eps))* xw2[..., [1]]  * weight2[None, None, :]) * g11 * nn.functional.sigmoid(g11)
     loss2 = o2.abs().sum()
     loss2.backward()
 
