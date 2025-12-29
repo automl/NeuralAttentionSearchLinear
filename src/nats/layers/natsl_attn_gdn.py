@@ -22,6 +22,7 @@ from fla.ops.utils.pooling import mean_pooling
 #from nats.ops.attns.attns import parallel_mixed_attn
 #from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
 from nats.ops.mixed_ops.mixed_attn_gdn import nats_mixed_attn_gdn
+from nats.modules.fused_norm_gate import FusedMultiInputRMSNormGated
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -130,14 +131,14 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             conv_size: int = 4,
             conv_bias: bool = False,
             conv_activation: str | None = 'silu',  # TODO check if None or silu works better?
-            outputs_are_wighted:bool = False,
+            outputs_are_wighted:bool = True,
             attn_qk_norm: bool = False,
             attn_with_short_conv: bool = False,
             compute_dnats_for_invalid_blocks_attn: bool= False,
             compute_dnats_for_invalid_blocks_linear_att: bool = False,
-            decay_for_non_gdn_blocks: bool = False,
+            decay_for_non_gdn_blocks: bool = True,
             incomplete_block_start_with_ht: bool = True,
-            attn_apply_pos_encoding: bool = True,
+            attn_apply_pos_encoding: bool = False,
             attn_rope_theta: Optional[float] = 10000.,
             attn_max_position_embeddings: Optional[int] = None,
             layer_idx: int = None,
@@ -182,8 +183,8 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         self.attn_max_position_embeddings = attn_max_position_embeddings
 
         if self.attn_qk_norm:
-            self.q_norm = RMSNorm(self.head_attn_k_dim)
-            self.k_norm = RMSNorm(self.head_attn_k_dim)
+            self.q_norm = RMSNorm(self.head_attn_k_dim, eps=norm_eps)
+            self.k_norm = RMSNorm(self.head_attn_k_dim, eps=norm_eps)
 
         self.attn_apply_pos_encoding = attn_apply_pos_encoding
 
@@ -303,7 +304,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             )
         if use_gate:
             self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-            self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=norm_eps)
+            self.o_norm = FusedMultiInputRMSNormGated(self.head_v_dim, eps=norm_eps)
         else:
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
@@ -480,11 +481,6 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
-            if self.outputs_are_wighted:
-                o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
-                o = o_gated_delta * o_weights[..., [1]] + o_attn.view(o_gated_delta.shape) * o_weights[..., [0]]
-            else:
-                o = o_gated_delta + o_attn.view(o_gated_delta.shape)
         elif mode == 'fused_recurrent':
             raise NotImplementedError
         else:
@@ -501,9 +497,15 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
 
         if self.use_gate:
             g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
-            o = self.o_norm(o, g)
+            if self.outputs_are_wighted:
+                o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
+                #o = self.o_norm(o_gated_delta * (o_weights[..., [1]] ), o_attn.view(o_gated_delta.shape) * o_weights[..., [0]], g)
+                o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape), g, o_weights)
+            else:
+                o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape),g)
         else:
-            o = self.o_norm(o)
+            raise NotImplementedError
+            #o = self.o_norm(o)
         o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
         if attention_mask is not None:
@@ -520,12 +522,15 @@ def test_mixed_attn():
 
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
 
-    layer = NeuralAttentionSearchLinear(hidden_size=512, head_dim=128, num_heads=2, num_attn_heads=4,
+    layer = NeuralAttentionSearchLinearAttnGDN(hidden_size=512, head_dim=64, num_heads=2, num_attn_heads=4,
                                         expand_v=1,
-                                        ops_for_incomplete_chunks='attn',
+                                        ops_for_incomplete_chunks='all',
                                         use_short_conv=False,
+                                               outputs_are_wighted=True,
                                         compute_dnats_for_invalid_blocks_linear_att=False,
-                                        compute_dnats_for_invalid_blocks_attn=False
+                                        compute_dnats_for_invalid_blocks_attn=False,
+                                               attn_qk_norm=True,
+                                               attn_with_short_conv=True,
 
                                         ).cuda()
     input_data = torch.randn((2, 512, 512)).cuda()
@@ -545,7 +550,7 @@ def test_mixed_attn():
     HATTN = 4
     HNATS = 2
 
-    T = 512
+    T = 1024
     N_OPTs = 2
     NATS_block_size = 64
     DATTN = 64
