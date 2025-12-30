@@ -270,9 +270,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
         if COMPUTE_INCOMPLETE_CHUNK_SCORES:
             b_n_iters = tl.cdiv(min(BT, T - i_t * BT), BS)
         elif USE_SW:
-            b_n_iters = tl.cdiv(
-                min(BT + min(i_t*BT, SW_SIZE), T - i_t * BT + SW_SIZE), BS
-            )
+            b_n_iters = tl.cdiv(min(BT + min(i_t*BT, SW_SIZE), T - i_t * BT + SW_SIZE), BS)
         else:
             b_n_iters = tl.cdiv(min(BT, T - i_t * BT) - NAtS_BLOCK_SIZE, BS)
 
@@ -307,7 +305,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                     m_s = tl.where(is_attn_block, m_s, m_s & rows_are_valid[:, None])
                 elif USE_SW:
                     m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
-                    rows_are_valid = o_q < ((i_nats_block + 1) * NAtS_BLOCK_SIZE - SW_SIZE)
+                    rows_are_valid = o_q < ((i_nats_block + 1) * NAtS_BLOCK_SIZE)
                     m_sw = (o_q[:, None] < o_k[None, :] + SW_SIZE) & m_s
                     m_s = tl.where(is_attn_block, m_s, m_sw)
                 else:
@@ -371,7 +369,9 @@ def parallel_attn_bwd_kernel_preprocess(
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BS'])
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BS']),
+    'USE_SW': lambda args: args['SW_SIZE'] is not None,
+    'COMPUTE_PARTIAL_CHUNKS': lambda args: args['USE_SW'] or args['COMPUTE_INCOMPLETE_CHUNK_SCORES']
 })
 @triton.jit
 def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
@@ -397,12 +397,15 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                                      BK: tl.constexpr,
                                      BV: tl.constexpr,
                                      NAtS_BLOCK_SIZE: tl.constexpr,
+                                     SW_SIZE: tl.constexpr,
                                      N_TYPES: tl.constexpr,
                                      OFFSET_ATTN: tl.constexpr,
                                      COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
                                      STAGE: tl.constexpr,
                                      USE_G: tl.constexpr,
                                      IS_VARLEN: tl.constexpr,
+                                     USE_SW: tl.constexpr,
+                                     COMPUTE_PARTIAL_CHUNKS: tl.constexpr,
                                      N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
                                      ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -478,7 +481,7 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
         b_gq = None
         b_dg = None
 
-    if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+    if COMPUTE_PARTIAL_CHUNKS:
         dk += (bos * HQ + i_hq) * K
         dv += (bos * HQ + i_hq) * V
 
@@ -515,7 +518,7 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                 b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
                 if USE_G:
                     b_dg += tl.sum(b_ds, 1)
-            if (NAtS_BLOCK_SIZE > BT and COMPUTE_INCOMPLETE_CHUNK_SCORES) or STAGE == 1:
+            if (NAtS_BLOCK_SIZE > BT and COMPUTE_PARTIAL_CHUNKS) or STAGE == 1:
                 # In this case, there is a chance that we need to compute an incomplete nats chunk
                 # For instance, i_T * BT = 16, NATS_BLOCK_SIZE=32, then b_n_iters will be 0, we still need
                 # to check if the [0,...16] are valid
@@ -554,7 +557,7 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                         b_p = exp2(b_s - b_lse[:, None])
                         b_dp = tl.dot(b_do, b_v)
                         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-                        if COMPUTE_INCOMPLETE_CHUNK_SCORES and (not is_attn_block):
+                        if COMPUTE_PARTIAL_CHUNKS and (not is_attn_block):
                             # we also need to compute the non-nats attention blocks if we compute incomplete blocks with
                             # attention as they will not be considered during dkdv
                             # TODO we need to test these !!!
@@ -570,23 +573,26 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
                         if USE_G:
                             b_dg += tl.sum(b_ds, 1)
-        if STAGE & 2 and (COMPUTE_INCOMPLETE_CHUNK_SCORES or BT > NAtS_BLOCK_SIZE):
+
+        if STAGE & 2 and (COMPUTE_PARTIAL_CHUNKS or BT > NAtS_BLOCK_SIZE):
             # if we do not need to compute incomplete chunks, and NAtS_BLOCK_SIZE is larger than BT,
             # Then no valid values within (i_t*BT, i_t*BT+BT) will exist, so we can skip them
 
             if COMPUTE_INCOMPLETE_CHUNK_SCORES:
                 b_n_iters = tl.cdiv(min(BT, T - i_t * BT), BS)
+            elif USE_SW:
+                b_n_iters = tl.cdiv(min(BT + min(i_t * BT, SW_SIZE), T - i_t * BT + SW_SIZE), BS)
             else:
                 b_n_iters = tl.cdiv(min(BT, T - i_t * BT) - NAtS_BLOCK_SIZE, BS)
 
             o_q = i_t * BT + tl.arange(0, BT)
             for i_iter in tl.range(0, b_n_iters, ):
-                i_s = (i_iter * BS + i_t * BT)
+                i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
                 i_nats_block = i_s // NAtS_BLOCK_SIZE
                 is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
                 #if is_attn_block or COMPUTE_INCOMPLETE_CHUNK_SCORES:
-                if COMPUTE_INCOMPLETE_CHUNK_SCORES or is_attn_block:
+                if COMPUTE_PARTIAL_CHUNKS or is_attn_block:
                     p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (0, 1))
                     p_v = tl.make_block_ptr(v, (V, T), (1, stride_vt), (i_v * BV, i_s), (BV, BS), (1, 0))
 
@@ -610,26 +616,31 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                         m_s = (o_q[:, None] >= o_k[None, :])
                         rows_are_valid = o_q < ((i_nats_block + 1) * NAtS_BLOCK_SIZE)
                         m_s = tl.where(is_attn_block, m_s, m_s & rows_are_valid[:, None]) & m_k[None, :]
+                    elif USE_SW:
+                        m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
+                        m_sw = ((o_q[:, None] < o_k[None, :] + SW_SIZE) & m_s) #& rows_are_valid[:, None]
+                        m_s = tl.where(is_attn_block, m_s, m_sw) & m_k[None, :]
                     else:
                         m_s_lower = (o_q[:, None] >= ((i_nats_block + 1) * NAtS_BLOCK_SIZE))
                         m_s = m_s_lower & m_k[None, :]
+
                     b_p = tl.where(m_s, exp2(b_s - b_lse[:, None]), 0)
                     # [BT, BV] @ [BV, BS] -> [BT, BS]
                     b_dp = tl.dot(b_do, b_v)
                     b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
                     # [BT, BS] @ [BS, BK] -> [BT, BK]
                     b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-
                     if COMPUTE_INCOMPLETE_CHUNK_SCORES and not is_attn_block:
+
                         # we also need to compute the non-nats attention blocks if we compute incomplete blocks with
                         # attention as they will not be considered during dkdv
                         b_dv = tl.dot(tl.trans(b_p).to(b_do.dtype), b_do)
                         b_dk = tl.dot(tl.trans(b_ds).to(b_q.dtype), b_q) * scale
+
                         p_dk = tl.make_block_ptr(dk, (T, K), (stride_qt, 1), (i_s, 0), (BS, BK), (1, 0))
                         p_dv = tl.make_block_ptr(dv, (T, V), (stride_ot, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
                         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty))
                         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty))
-
                     if USE_G:
                         # TOOD check if we need to consider COMPUTE_INCOMPLETE_CHUNK_SCORES and not seperatedly...
                         b_dg += tl.sum(b_ds, 1)
@@ -644,7 +655,9 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT'])
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT']),
+    'USE_SW': lambda args: args['SW_SIZE'] is not None,
+    'COMPUTE_PARTIAL_CHUNKS': lambda args: args['USE_SW'] or args['COMPUTE_INCOMPLETE_CHUNK_SCORES']
 })
 @triton.jit
 def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
@@ -669,6 +682,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                                   BT: tl.constexpr,
                                   BS: tl.constexpr,
                                   NAtS_BLOCK_SIZE: tl.constexpr,
+                                  SW_SIZE: tl.constexpr,
                                   N_TYPES: tl.constexpr,
                                   OFFSET_ATTN: tl.constexpr,
                                   COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
@@ -676,6 +690,8 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                                   USE_G: tl.constexpr,
                                   IS_VARLEN: tl.constexpr,
                                   N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
+                                  USE_SW: tl.constexpr,
+                                  COMPUTE_PARTIAL_CHUNKS: tl.constexpr,
                                   ):
     # i_v, off_n, off_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_v, i_t_, i_gnats = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -767,7 +783,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
         b_gk = None
         b_dg = None
 
-    if STAGE & 2 and COMPUTE_INCOMPLETE_CHUNK_SCORES:
+    if STAGE & 2 and COMPUTE_PARTIAL_CHUNKS:
         lo, hi = i_t0, min(i_t0 + BT, T)
 
         for i_s in range(lo, hi, BS):
@@ -806,7 +822,7 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
 
     if STAGE & 1:
         if STAGE == 3:
-            if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+            if COMPUTE_PARTIAL_CHUNKS:
                 lo = i_t0 + BT
             else:
                 lo = b_i_nats_block * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
@@ -916,39 +932,45 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT'])
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BT']),
+    'USE_SW': lambda args: args['SW_SIZE'] is not None,
+    'COMPUTE_PARTIAL_CHUNKS': lambda args: args['USE_SW'] or args['COMPUTE_INCOMPLETE_CHUNK_SCORES']
 })
 @triton.jit
 def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of shape [B, T, H, DQ]
-                                  g_cumsum, lse, delta,
-                                  do, dg_cumsum,
-                                  nats_block_types, nats_block_indices,  # Both are of shape [B, T, HAttns]
-                                  cu_seqlens, cu_seqlens_nats,
-                                  dk, dv, dnats,  # used to store the in complete chunk scores
-                                  scale,
-                                  T: tl.constexpr,
-                                  TNAtS: tl.constexpr,
-                                  B: tl.constexpr,
-                                  HQ: tl.constexpr,
-                                  HKV: tl.constexpr,
-                                  G: tl.constexpr,
-                                  HNAtS: tl.constexpr,
-                                  GNAtS: tl.constexpr,
-                                  K: tl.constexpr,
-                                  V: tl.constexpr,
-                                  BK: tl.constexpr,
-                                  BV: tl.constexpr,
-                                  BT: tl.constexpr,
-                                  BS: tl.constexpr,
-                                  NAtS_BLOCK_SIZE: tl.constexpr,
-                                  N_TYPES: tl.constexpr,
-                                  OFFSET_ATTN: tl.constexpr,
-                                  COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
-                                  STAGE: tl.constexpr,
-                                  USE_G: tl.constexpr,
-                                  IS_VARLEN: tl.constexpr,
-                                  N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
-                                  ):
+                                                      g_cumsum, lse, delta,
+                                                      do, dg_cumsum,
+                                                      nats_block_types, nats_block_indices,  # Both are of shape [B, T, HAttns]
+                                                      cu_seqlens, cu_seqlens_nats,
+                                                      dk, dv, dnats,  # used to store the in complete chunk scores
+                                                      scale,
+                                                      T: tl.constexpr,
+                                                      TNAtS: tl.constexpr,
+                                                      B: tl.constexpr,
+                                                      HQ: tl.constexpr,
+                                                      HKV: tl.constexpr,
+                                                      G: tl.constexpr,
+                                                      HNAtS: tl.constexpr,
+                                                      GNAtS: tl.constexpr,
+                                                      K: tl.constexpr,
+                                                      V: tl.constexpr,
+                                                      BK: tl.constexpr,
+                                                      BV: tl.constexpr,
+                                                      BT: tl.constexpr,
+                                                      BS: tl.constexpr,
+                                                      NAtS_BLOCK_SIZE: tl.constexpr,
+                                                      SW_SIZE:tl.constexpr,
+                                                      N_TYPES: tl.constexpr,
+                                                      OFFSET_ATTN: tl.constexpr,
+                                                      COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
+                                                      COMPUTE_DNATS_FOR_INVALID_BLCOKS: tl.constexpr,
+                                                      STAGE: tl.constexpr,
+                                                      USE_G: tl.constexpr,
+                                                      IS_VARLEN: tl.constexpr,
+                                                      N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
+                                                      USE_SW:tl.constexpr,
+                                                      COMPUTE_PARTIAL_CHUNKS: tl.constexpr,
+                                                      ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     #i_v, i_t_, i_gnats = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -1036,15 +1058,15 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
         b_dg = None
 
     load_idx_chunk = i_t * BT // NAtS_BLOCK_SIZE
-    chunk_is_delta = tl.load(nats_block_types + load_idx_chunk * stride_block_types_t).to(tl.int1)
-    if chunk_is_delta:
+    chunk_is_attn = tl.load(nats_block_types + load_idx_chunk * stride_block_types_t).to(tl.int1)
+    if chunk_is_attn:
         p_dk = tl.make_block_ptr(dk + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t0, 0), (BT, BK), (1, 0))
         p_dv = tl.make_block_ptr(dv + (bos * HQ + i_hq) * V, (T, V), (HQ * V, 1), (i_t0, i_v * BV), (BT, BV), (1, 0))
 
         b_dk = tl.zeros([BT, BK], dtype=tl.float32)
         b_dv = tl.zeros([BT, BV], dtype=tl.float32)
 
-        if STAGE & 2 and COMPUTE_INCOMPLETE_CHUNK_SCORES:
+        if STAGE & 2 and COMPUTE_PARTIAL_CHUNKS:
             lo, hi = i_t0, min(i_t0 + BT, T)
 
             for i_s in range(lo, hi, BS):
@@ -1083,7 +1105,7 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
 
         if STAGE & 1:
             if STAGE == 3:
-                if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+                if COMPUTE_PARTIAL_CHUNKS:
                     lo = i_t0 + BT
                 else:
                     lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
@@ -1162,7 +1184,7 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
                 b_ds = b_p * (b_dp - b_delta[None, :])
                 # [BT, BS] @ [BS, BK] -> [BT, BK]
                 b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
-
+                # TODO consider the impact of sliding window sizes for dnats?
                 b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
 
                 if USE_G:
@@ -1173,7 +1195,6 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
         #if COMPUTE_INCOMPLETE_CHUNK_SCORES:
         #    b_dk += tl.load(p_dk, boundary_check=(0,1))
         #    b_dv += tl.load(p_dv, boundary_check=(0,1))
-
 
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
@@ -1187,51 +1208,22 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
         if USE_G:
             p_dg = tl.make_block_ptr(dg_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
             tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
+
     else:
         # THis is the case where we only compute d_nats. This might be too expensive, we need to check if we could
         # approximate this gradient information...
         if STAGE & 1:
-            if STAGE == 3:
-                lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
-            else:
-                lo = 0
-            n_iters = (T - lo) // BS
-            for i_s_ in range(n_iters):
+            if USE_SW:
+                # WE first need to compute dk dv for teh sliding window sizes
+
+                b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+                b_dv = tl.zeros([BT, BV], dtype=tl.float32)
+
+            n_iters1 = tl.cdiv(min((BT + SW_SIZE), T - BT), BS)
+            lo, hi = i_t0, min(i_t0 + BT, T)
+            for i_s_ in range(n_iters1):
                 i_s = lo + i_s_ * BS
                 i_s = tl.multiple_of(i_s, BS)
-                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
-                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
-                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
-
-                # [BS]
-                o_q = i_s + tl.arange(0, BS)
-                # [BS, BK]
-                b_q = tl.load(p_q, boundary_check=(0, 1))
-                # [BS, BV]
-                b_do = tl.load(p_do, boundary_check=(0, 1))
-                # [BS]
-                b_lse = tl.load(p_lse, boundary_check=(0,))
-                b_delta = tl.load(p_delta, boundary_check=(0,))
-                # [BT, BS]
-                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
-                if USE_G:
-                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
-                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
-                    b_s += b_gq[None, :] - b_gk[:, None]
-                b_p = exp2(b_s - b_lse[None, :])
-                b_p = tl.clamp(b_p, 0., 1.)
-                # [BT, BS] @ [BS, BV] -> [BT, BV]
-                # [BT, BV] @ [BV, BS] -> [BT, BS]
-                b_dp = tl.dot(b_v, tl.trans(b_do))
-                # [BT, BS]
-                b_ds = b_p * (b_dp - b_delta[None, :])
-                # [BT, BS] @ [BS, BK] -> [BT, BK]
-                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
-            hi = tl.cdiv(T - lo, BS) * BS + lo
-            if hi > T:
-                i_s = hi - BS
-                # the last block with q partially involved
                 p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
                 p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
                 p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
@@ -1253,22 +1245,116 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
                     p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
                     b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
                     b_s += b_gq[None, :] - b_gk[:, None]
-                b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
-                b_p = tl.clamp(b_p, 0., 1.)
-                # [BT, BS] @ [BS, BV] -> [BT, BV]
-                # [BT, BV] @ [BV, BS] -> [BT, BS]
-                b_dp = tl.dot(b_v, tl.trans(b_do))
-                # [BT, BS]
-                b_ds = b_p * (b_dp - b_delta[None, :])
-                # [BT, BS] @ [BS, BK] -> [BT, BK]
-                b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+                m_s = (o_k[:, None] <= o_q[None, :])
+                m_sw = ((o_q[None, :] < o_k[:, None] + SW_SIZE) & m_s)
 
-        # TODO currently we only consider the gradients where the blocks are selected as attns.
-        #  We could also in principle compute
-        tl.store(
-            dnats + i_t * stride_dblock_attn_t,
-            b_dattn.to(dnats.dtype.element_ty)
-        )
+                b_p = tl.where(m_sw & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                b_dp = tl.dot(b_v, tl.trans(b_do))
+                b_ds = b_p * (b_dp - b_delta[None, :])
+                if USE_SW:
+                    # [BT, BS] @ [BS, BV] -> [BT, BV]
+                    b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+                    # [BT, BV] @ [BV, BS] -> [BT, BS]
+                    # [BT, BS]
+                    # [BT, BS] @ [BS, BK] -> [BT, BK]
+                    b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+                if COMPUTE_DNATS_FOR_INVALID_BLCOKS:
+                    b_p1 = tl.where(m_s & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                    b_p1 = tl.clamp(b_p1, 0., 1.)
+                    b_ds1 = b_p1 * (b_dp - b_delta[None, :])
+                    b_dattn += tl.sum(
+                        tl.where(m_k[:, None] & o_q > load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE, b_ds1, 0)
+                    )
+                if USE_G:
+                    b_dg -= tl.sum(b_ds, 1)
+            if USE_SW:
+                p_dk = tl.make_block_ptr(dk + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t0, 0), (BT, BK), (1, 0))
+                p_dv = tl.make_block_ptr(dv + (bos * HQ + i_hq) * V, (T, V), (HQ * V, 1), (i_t0, i_v * BV), (BT, BV),
+                                         (1, 0))
+                b_dk = b_dk * scale
+                tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+            # Now we need to work on blocks without any attn scores
+            if COMPUTE_DNATS_FOR_INVALID_BLCOKS:
+
+                if STAGE == 3:
+                    lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE + SW_SIZE
+                else:
+                    lo = 0
+                n_iters = (T - lo) // BS
+                for i_s_ in range(n_iters):
+                    i_s = lo + i_s_ * BS
+                    i_s = tl.multiple_of(i_s, BS)
+                    p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                    p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                    p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                    # [BS]
+                    o_q = i_s + tl.arange(0, BS)
+                    # [BS, BK]
+                    b_q = tl.load(p_q, boundary_check=(0, 1))
+                    # [BS, BV]
+                    b_do = tl.load(p_do, boundary_check=(0, 1))
+                    # [BS]
+                    b_lse = tl.load(p_lse, boundary_check=(0,))
+                    b_delta = tl.load(p_delta, boundary_check=(0,))
+                    # [BT, BS]
+                    b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                    if USE_G:
+                        p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                        b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                        b_s += b_gq[None, :] - b_gk[:, None]
+                    b_p = exp2(b_s - b_lse[None, :])
+                    b_p = tl.clamp(b_p, 0., 1.)
+                    # [BT, BS] @ [BS, BV] -> [BT, BV]
+                    # [BT, BV] @ [BV, BS] -> [BT, BS]
+                    b_dp = tl.dot(b_v, tl.trans(b_do))
+                    # [BT, BS]
+                    b_ds = b_p * (b_dp - b_delta[None, :])
+                    # [BT, BS] @ [BS, BK] -> [BT, BK]
+                    b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+                hi = tl.cdiv(T - lo, BS) * BS + lo
+                if hi > T:
+                    i_s = hi - BS
+                    # the last block with q partially involved
+                    p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                    p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                    p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+
+                    # [BS]
+                    o_q = i_s + tl.arange(0, BS)
+                    m_q = o_q < T
+                    # [BS, BK]
+                    b_q = tl.load(p_q, boundary_check=(0, 1))
+                    # [BS, BV]
+                    b_do = tl.load(p_do, boundary_check=(0, 1))
+                    # [BS]
+                    b_lse = tl.load(p_lse, boundary_check=(0,))
+                    b_delta = tl.load(p_delta, boundary_check=(0,))
+                    # [BT, BS]
+                    b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                    if USE_G:
+                        p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                        b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                        b_s += b_gq[None, :] - b_gk[:, None]
+                    b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                    b_p = tl.clamp(b_p, 0., 1.)
+                    # [BT, BS] @ [BS, BV] -> [BT, BV]
+                    # [BT, BV] @ [BV, BS] -> [BT, BS]
+                    b_dp = tl.dot(b_v, tl.trans(b_do))
+                    # [BT, BS]
+                    b_ds = b_p * (b_dp - b_delta[None, :])
+                    # [BT, BS] @ [BS, BK] -> [BT, BK]
+                    b_dattn += tl.sum(tl.where(m_k[:, None], b_ds, 0))
+
+                # TODO currently we only consider the gradients where the blocks are selected as attns.
+                #  We could also in principle compute
+                tl.store(
+                    dnats + i_t * stride_dblock_attn_t,
+                    b_dattn.to(dnats.dtype.element_ty)
+                )
 
 
 def parallel_attn_nats_fwd(
@@ -1414,6 +1500,7 @@ def parallel_attn_nats_bwd(
         OFFSET_ATTN: int = 0,
         compute_incomplete_chunk_scores: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool = False,
+        sliding_window_size: int | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_nats: torch.LongTensor | None = None,
         is_causal=True
@@ -1450,6 +1537,9 @@ def parallel_attn_nats_bwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NV = triton.cdiv(V, BV)
 
+    if sliding_window_size is not None:
+        assert sliding_window_size >= NAtS_block_size, 'The sliding window size must be greater than the nats block size!'
+
     delta = parallel_attn_bwd_preprocess(o, do)
 
     dq = torch.empty(B, T, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device)
@@ -1470,7 +1560,9 @@ def parallel_attn_nats_bwd(
 
     n_iters_per_block = compute_attn_n_iters_per_block(
         nats_block_indices,
-        T, BT, BS, NAtS_block_size, OFFSET_ATTN
+        T, BT, BS, NAtS_block_size, OFFSET_ATTN,
+        0,
+        sliding_window_size,
     )
 
     parallel_nats_attn_bwd_kernel_dq[grid](q=q, k=k, v=v,
@@ -1493,6 +1585,7 @@ def parallel_attn_nats_bwd(
                                            BK=BK,
                                            BV=BV,
                                            NAtS_BLOCK_SIZE=NAtS_block_size,
+                                           SW_SIZE=sliding_window_size,
                                            STAGE=stage,
                                            COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
                                            N_TYPES=N_TYPES,
@@ -1501,11 +1594,10 @@ def parallel_attn_nats_bwd(
                                            )
 
     # n_grids =prepare_nats_block_indices
-
     BS = triton.cdiv(BT, NAtS_block_size) * BS  # TODO check if this is really beneficial!!!
     BT = min(BT, NAtS_block_size)  # we need to ensure that each BT block only loads one BT
 
-    if compute_dnats_for_invalid_blocks_attn:
+    if sliding_window_size is not None or compute_dnats_for_invalid_blocks_attn:
         grid_kv = grid
         parallel_attn_bwd_kernel_dkdv_within_valid_blocks[grid_kv](
             q=q, k=k, v=v,
@@ -1526,8 +1618,10 @@ def parallel_attn_nats_bwd(
             BK=BK,
             BV=BV,
             NAtS_BLOCK_SIZE=NAtS_block_size,
+            SW_SIZE=sliding_window_size,
             STAGE=stage,
             COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
+            COMPUTE_DNATS_FOR_INVALID_BLCOKS=compute_dnats_for_invalid_blocks_attn,
             N_TYPES=N_TYPES,
             OFFSET_ATTN=OFFSET_ATTN,
             num_warps=num_warps,
@@ -1557,6 +1651,7 @@ def parallel_attn_nats_bwd(
             BK=BK,
             BV=BV,
             NAtS_BLOCK_SIZE=NAtS_block_size,
+            SW_SIZE=sliding_window_size,
             STAGE=stage,
             COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
             N_TYPES=N_TYPES,
@@ -1613,7 +1708,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
         ctx.cu_seqlens = cu_seqlens
         ctx.scale = scale
         ctx.NAtS_block_size = NAtS_block_size
-        ctx.sliding_window_size=sliding_window_size,
+        ctx.sliding_window_size=sliding_window_size
         ctx.cu_seqlens_nats = cu_seqlens_nats
         ctx.offset_attn = offset_attn
         ctx.compute_incomplete_chunk_scores = compute_incomplete_chunk_scores
@@ -1638,6 +1733,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
             OFFSET_ATTN=ctx.offset_attn,
             compute_incomplete_chunk_scores=ctx.compute_incomplete_chunk_scores,
             compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
+            sliding_window_size=ctx.sliding_window_size,
             cu_seqlens=ctx.cu_seqlens,
             cu_seqlens_nats=ctx.cu_seqlens_nats,
             is_causal=ctx.is_causal,
@@ -1808,8 +1904,8 @@ def test_mixed_attns():
                                    NAtS_block_size=NATS_Chunk,
                                    store_msk=True
                                    )
-    #loss = (out1 ** 2).sum()
-    #loss.backward()
+    loss = (out1 ** 2).sum()
+    loss.backward()
 
     q1 = copy.deepcopy(q.detach()).view(BATCH, T, HQ * GATTN, D_HEAD // GATTN).transpose(1, 2)
     k1 = copy.deepcopy(k.detach()).view(BATCH, T, H * GATTN, D_HEAD // GATTN).transpose(1, 2)
@@ -1883,8 +1979,6 @@ def test_mixed_attns():
 
     print(f'out diff max:{(out2 - out1).max()}')
     print(f'out diff min:{(out2 - out1).min()}')
-    import pdb
-    pdb.set_trace()
     print(f'q grad max: {(q0.grad - q1.grad.transpose(1, 2)).max()}')
     print(f'q grad min: {(q0.grad - q1.grad.transpose(1, 2)).min()}')
 

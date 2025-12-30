@@ -47,6 +47,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
                 n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
                 scale_attn, scale_lattn, cu_seqlens, cu_seqlens_nats,
                 nats_block_size: int,
+                attn_sw_size: int | None = None,
                 ops_for_incomplete_chunks: str = 'gated_delta_net',
                 output_final_state_gated_delta: bool = False,
                 compute_dnats_for_invalid_blocks_attn: bool = False,
@@ -102,6 +103,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         o_attn, lse_attn, _ = parallel_attn_nats_fwd(
             q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
             g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
+            sliding_window_size=attn_sw_size,
             offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn,
             is_causal=True, store_msk=False,
         )
@@ -166,6 +168,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         ctx.scale_lattn = scale_lattn
 
         ctx.nats_block_size = nats_block_size
+        ctx.attn_sw_size = attn_sw_size
         ctx.lattn_use_qk_l2norm_in_kernel = lattn_use_qk_l2norm_in_kernel
 
         ctx.OFFSET_ATTN = OFFSET_ATTN
@@ -209,6 +212,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             do=do_attn,
             scale=ctx.scale_attn,
             NAtS_block_size=ctx.nats_block_size,
+            sliding_window_size=ctx.attn_sw_size,
             OFFSET_ATTN=ctx.OFFSET_ATTN,
             compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
             compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn,
@@ -259,7 +263,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
                dh0_gated_delta, \
                dg_gated_delta, db, dnats, None, \
                None, None, None, None, \
-               None, None, None, None, None, None, None, None, None
+               None, None, None, None, None, None, None, None, None, None
 
 
 def nats_mixed_attn_gdn(
@@ -273,6 +277,7 @@ def nats_mixed_attn_gdn(
         scale_attn=None, scale_lattn=None,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size: int = 64,
+        attn_sw_size: int | None = None,
         ops_for_incomplete_chunks: str = 'gated_delta_net',
         output_final_state_gated_delta: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool = False,  # TODO this is not activated yet, we need to fix that!
@@ -292,7 +297,7 @@ def nats_mixed_attn_gdn(
         initial_state_gated_delta, g, beta,
         nats_block_types, n_nats_blocks, scale_attn,
         scale_lattn, cu_seqlens, cu_seqlens_nats,
-        nats_block_size, ops_for_incomplete_chunks,
+        nats_block_size, attn_sw_size, ops_for_incomplete_chunks,
         output_final_state_gated_delta,
         compute_dnats_for_invalid_blocks_attn,
         compute_dnats_for_invalid_blocks_linear_att,
