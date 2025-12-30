@@ -1,7 +1,3 @@
-import pdb
-
-import pytest
-import os
 import warnings
 
 import torch
@@ -55,56 +51,12 @@ def compute_mask_lower(start_n: tl.constexpr, NAtS_block_size: tl.constexpr, N_N
     return mask_lower
 """
 
-
-@triton.jit
-def compute_attn_mask_on_band(
-        attn_columns,
-        i_s,
-        offs_t,
-        offs_s,
-        BT: tl.constexpr,
-        BS: tl.constexpr,
-        N_NAtS_Chunk_PER_S: tl.constexpr,
-        NAtS_block_size: tl.constexpr,
-        COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
-):
-    # This maks corresponds to the attention maps under the chunk-casual triangles. This ensures that
-    # all the chunked values within this mask receives the full attentions
-    # This value is of shape[N_NAtS_Chunk_PER_S, BT]
-
-    # Since this is only applied in on band computation, we do not skip any
-    # mask_lower = compute_mask_lower(i_s, NAtS_block_size, N_NAtS_Chunk_PER_S, offs_t)
-    offs_s_lower = i_s + tl.arange(0, N_NAtS_Chunk_PER_S) * NAtS_block_size + NAtS_block_size - 1
-    mask_lower = offs_s_lower[None, :] <= offs_t[:, None]
-
-    if COMPUTE_INCOMPLETE_CHUNK_SCORES:
-        mask = tl.reshape(
-            offs_t[:, None] >= (i_s + offs_s[None, :]),
-            [BT, N_NAtS_Chunk_PER_S, NAtS_block_size]
-        )
-        # if the column is invalid, we only need the attn values within the incomplete chunks
-        mask_incomplete_chunks = mask & ~mask_lower[:, :, None]
-        # debuging only
-        # mask_incomplete_chunks = mask & (1 - mask_lower[:, :, None].to(tl.int32)).to(tl.int1)
-        mask = tl.where(
-            attn_columns[None, :, None],
-            mask,
-            mask_incomplete_chunks
-        )
-    else:
-        mask = tl.where(attn_columns[None, :, None], mask_lower[:, :, None], False)
-        # debuging only
-        # mask = tl.where(attn_columns[None, :, None], mask_lower[:, :, None], 0)
-        mask = tl.broadcast_to(mask, (BT, N_NAtS_Chunk_PER_S, NAtS_block_size))
-        mask_incomplete_chunks = mask_lower
-    mask = tl.reshape(mask, (BT, BS))
-    return mask, mask_incomplete_chunks
-
-
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BS'])
+    'N_CHUNK_PER_NAtS_BLOCK': lambda args: triton.cdiv(args['NAtS_BLOCK_SIZE'], args['BS']),
+    'USE_SW': lambda args: args['SW_SIZE'] is not None,
+    'COMPUTE_PARTIAL_CHUNKS': lambda args: args['USE_SW'] or args['COMPUTE_INCOMPLETE_CHUNK_SCORES']
 })
 @triton.jit
 def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
@@ -129,6 +81,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                                   BK: tl.constexpr,
                                   BV: tl.constexpr,
                                   NAtS_BLOCK_SIZE: tl.constexpr,
+                                  SW_SIZE:tl.constexpr,
                                   N_TYPES: tl.constexpr,
                                   OFFSET_ATTN: tl.constexpr,
                                   COMPUTE_INCOMPLETE_CHUNK_SCORES: tl.constexpr,
@@ -136,6 +89,8 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                                   USE_G: tl.constexpr,
                                   IS_VARLEN: tl.constexpr,
                                   N_CHUNK_PER_NAtS_BLOCK: tl.constexpr,
+                                  USE_SW: tl.constexpr,
+                                  COMPUTE_PARTIAL_CHUNKS: tl.constexpr,
                                   STORE_MSK: tl.constexpr
                                   ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -238,8 +193,8 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 b_s = tl.dot(b_q, b_k) * qk_scale
                 if USE_G:
                     o_k = i_s + tl.arange(0, BS)
-                    p_gk = tl.make_block_ptr(g_cumsum, (T,), (HQ,), (o_k,), (BT,), (0,))
-                    b_gk = tl.load(p_gk, boundary_check=(0,)).to(tl.float32)
+                    m_k = o_k < T
+                    b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
                     b_s += b_gq[:, None] - b_gk[None, :]
 
                 # [BT, BS]
@@ -256,7 +211,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                     p_msk = tl.make_block_ptr(msk, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (0, 1))
                     tl.store(p_msk, (tl.zeros([BT, BS], dtype=tl.float32) + 1).to(p_msk.dtype.element_ty))
 
-        if (NAtS_BLOCK_SIZE > BT and COMPUTE_INCOMPLETE_CHUNK_SCORES) or STAGE == 1:
+        if (NAtS_BLOCK_SIZE > BT and COMPUTE_PARTIAL_CHUNKS) or STAGE == 1:
             # In this case, there is a chance that we need to compute an incomplete nats chunk
             # For instance, i_T * BT = 16, NATS_BLOCK_SIZE=32, then b_n_iters will be 0, we still need
             # to check if the [0,...16] are valid
@@ -307,23 +262,28 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                     # [BT, BV]
                     b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
                     b_mp = b_m
-    if STAGE & 2 and (COMPUTE_INCOMPLETE_CHUNK_SCORES or BT > NAtS_BLOCK_SIZE):
+
+    if STAGE & 2 and (COMPUTE_PARTIAL_CHUNKS or BT > NAtS_BLOCK_SIZE):
         # if we do not need to compute incomplete chunks, and NAtS_BLOCK_SIZE is larger than BT,
         # Then no valid values within (i_t*BT, i_t*BT+BT) will exist, so we can skip them
 
         if COMPUTE_INCOMPLETE_CHUNK_SCORES:
             b_n_iters = tl.cdiv(min(BT, T - i_t * BT), BS)
+        elif USE_SW:
+            b_n_iters = tl.cdiv(
+                min(BT + min(i_t*BT, SW_SIZE), T - i_t * BT + SW_SIZE), BS
+            )
         else:
             b_n_iters = tl.cdiv(min(BT, T - i_t * BT) - NAtS_BLOCK_SIZE, BS)
 
         o_q = i_t * BT + tl.arange(0, BT)
 
         for i_iter in tl.range(0, b_n_iters, ):
-            i_s = (i_iter * BS + i_t * BT)
+            i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
             i_nats_block = i_s // NAtS_BLOCK_SIZE
             is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
-            if COMPUTE_INCOMPLETE_CHUNK_SCORES or is_attn_block:
+            if COMPUTE_PARTIAL_CHUNKS or is_attn_block:
                 p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (0, 1))
                 p_v = tl.make_block_ptr(v, (T, V), (stride_vt, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
 
@@ -345,6 +305,11 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                     m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
                     rows_are_valid = o_q < ((i_nats_block + 1) * NAtS_BLOCK_SIZE)
                     m_s = tl.where(is_attn_block, m_s, m_s & rows_are_valid[:, None])
+                elif USE_SW:
+                    m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
+                    rows_are_valid = o_q < ((i_nats_block + 1) * NAtS_BLOCK_SIZE - SW_SIZE)
+                    m_sw = (o_q[:, None] < o_k[None, :] + SW_SIZE) & m_s
+                    m_s = tl.where(is_attn_block, m_s, m_sw)
                 else:
                     m_s = (o_q[:, None] >= ((i_nats_block + 1) * NAtS_BLOCK_SIZE)) & m_k[None, :]
                     rows_are_valid = tl.full((BT,), value=1, dtype=tl.int1)
@@ -356,7 +321,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 b_s = tl.where(m_s, b_s, float('-inf'))
                 # [BT]
                 b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-                if COMPUTE_INCOMPLETE_CHUNK_SCORES:
+                if COMPUTE_PARTIAL_CHUNKS:
                     rows_are_valid = rows_are_valid or (b_m != float('-inf'))
                     b_r = tl.where(rows_are_valid, exp2(b_mp - b_m), 0)
                     # [BT, BS]
@@ -369,7 +334,6 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 # [BT, BV]
                 b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
                 b_mp = b_m
-
 
     # this function remove the invalid
     rows_are_valid = b_m != float('-inf')
@@ -1319,6 +1283,7 @@ def parallel_attn_nats_fwd(
         offset_attn: int = 0,
         compute_incomplete_chunk_scores: bool = False,
         chunk_size: int = 128,
+        sliding_window_size: int | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_nats: torch.LongTensor | None = None,
         is_causal=True,
@@ -1360,6 +1325,8 @@ def parallel_attn_nats_fwd(
 
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert NK == 1, "The key dimension can not be larger than 256"
+    if sliding_window_size is not None:
+        assert sliding_window_size >= NAtS_block_size, 'The sliding window size must be greater than the nats block size!'
 
     n_iters_per_block = compute_attn_n_iters_per_block(
         nats_block_indices,
@@ -1367,7 +1334,9 @@ def parallel_attn_nats_fwd(
         BT,
         BS,
         NAtS_block_size,
-        offset_attn
+        offset_attn,
+        0,
+        sliding_window_size,
     )
 
     stage = 3 if is_causal else 1
@@ -1401,6 +1370,7 @@ def parallel_attn_nats_fwd(
         BK=BK,
         BV=BV,
         NAtS_BLOCK_SIZE=NAtS_block_size,
+        SW_SIZE=sliding_window_size,
         STAGE=stage,
         COMPUTE_INCOMPLETE_CHUNK_SCORES=compute_incomplete_chunk_scores,
         N_TYPES=N_TYPES,
@@ -1621,6 +1591,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
                 n_nats_blocks: torch.Tensor,
                 scale, cu_seqlens, cu_seqlens_nats,
                 NAtS_block_size: int,
+                sliding_window_size: int | None = None,
                 offset_attn: int = 0,
                 compute_incomplete_chunk_scores: bool = True,
                 compute_dnats_for_invalid_blocks_attn: bool = False,
@@ -1633,7 +1604,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
         g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
         o, lse, msk = parallel_attn_nats_fwd(
             q, k, v, nats_block_types, nats_block_indices,
-            g_cumsum, scale, NAtS_block_size=NAtS_block_size,
+            g_cumsum, scale, NAtS_block_size=NAtS_block_size, sliding_window_size=sliding_window_size,
             offset_attn=offset_attn, compute_incomplete_chunk_scores=compute_incomplete_chunk_scores,
             is_causal=is_causal, store_msk=store_msk,
         )
@@ -1642,6 +1613,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
         ctx.cu_seqlens = cu_seqlens
         ctx.scale = scale
         ctx.NAtS_block_size = NAtS_block_size
+        ctx.sliding_window_size=sliding_window_size,
         ctx.cu_seqlens_nats = cu_seqlens_nats
         ctx.offset_attn = offset_attn
         ctx.compute_incomplete_chunk_scores = compute_incomplete_chunk_scores
@@ -1675,7 +1647,7 @@ class AttentionNAtSFunction(torch.autograd.Function):
         else:
             d_chunk_type = d_chunk_type.unsqueeze(-1)
         return dq.to(q), dk.to(k), dv.to(v), dg, d_chunk_type.to(
-            nats_block_types), None, None, None, None, None, None, None, None, None, None, None
+            nats_block_types), None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def parallel_nats_attn(
@@ -1685,7 +1657,8 @@ def parallel_nats_attn(
         nats_block_indices: torch.LongTensor,
         n_nats_blocks: torch.Tensor,
         scale, cu_seqlens=None, cu_seqlens_nats=None,
-        NAtS_block_size: int = 1,
+        NAtS_block_size: int = 64,
+        sliding_window_size: int=64,
         offset_attn: int = 0,
         compute_incomplete_chunk_scores: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool=False,
@@ -1765,7 +1738,8 @@ def parallel_nats_attn(
     o, msk = AttentionNAtSFunction.apply(q, k, v, g,
                                          nats_block_types, nats_block_indices, n_nats_blocks,
                                          scale, cu_seqlens,
-                                         cu_seqlens_nats, NAtS_block_size, offset_attn,
+                                         cu_seqlens_nats, NAtS_block_size, sliding_window_size,
+                                         offset_attn,
                                          compute_incomplete_chunk_scores,
                                          compute_dnats_for_invalid_blocks_attn,
                                          is_causal, store_msk
@@ -1777,7 +1751,7 @@ def test_mixed_attns():
     # TODO move this to tests!
     torch.manual_seed(0)
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-    #dtype = torch.float16
+    dtype = torch.float16
 
     import math
     import copy
@@ -1819,7 +1793,7 @@ def test_mixed_attns():
     attn_types_ = torch.nn.Parameter(attn_types, requires_grad=True)
 
     compute_incomplete_chunk_scores = False
-
+    sliding_window_size=64
 
     out1, msk = parallel_nats_attn(q0.view(BATCH, T, HQ * GATTN, D_HEAD // GATTN),
                                    k0.view(BATCH, T, H * GATTN, D_HEAD // GATTN),
@@ -1834,8 +1808,8 @@ def test_mixed_attns():
                                    NAtS_block_size=NATS_Chunk,
                                    store_msk=True
                                    )
-    loss = (out1 ** 2).sum()
-    loss.backward()
+    #loss = (out1 ** 2).sum()
+    #loss.backward()
 
     q1 = copy.deepcopy(q.detach()).view(BATCH, T, HQ * GATTN, D_HEAD // GATTN).transpose(1, 2)
     k1 = copy.deepcopy(k.detach()).view(BATCH, T, H * GATTN, D_HEAD // GATTN).transpose(1, 2)
@@ -1886,14 +1860,18 @@ def test_mixed_attns():
     mask_ = valid_columns.unsqueeze(-2) * full_chunks[None, None, :, :].to(valid_columns)
 
     mask_ = mask_.repeat_interleave(NATS_Chunk, 3)
-
-    if compute_incomplete_chunk_scores:
+    if sliding_window_size is not None:
+        mask_sw =  (torch.arange(T)[:, None] >= (torch.arange(T)[None, :])).cuda()
+        #mask_sw = mask_sw & (torch.arange(T)[None,:]+sliding_window_size > torch.arange(T)[:, None]).cuda()
+        mask_sw = mask_sw & (torch.arange(T)[:, None]-sliding_window_size < (torch.arange(T)[None, :])).cuda()
+        mask_ = mask_ + mask_sw.view(1, 1, T, T).to(mask_)
+    elif compute_incomplete_chunk_scores:
         # mask_diag =
         mask_diag = (torch.arange(0, NATS_Chunk, device=device)[:, None] >= torch.arange(0, NATS_Chunk, device=device))
         mask_diag = torch.block_diag(*[mask_diag for _ in range(TNAtS)])
         mask_ = mask_ + mask_diag.view(1, 1, T, T).to(mask_)
 
-    mask_ = repeat_masks(mask_, HQ // HAttns)
+    mask_ = repeat_masks(mask_, HQ // HAttns).bool().to(msk)
 
     k2 = repeat_kv(k1, HQ // H)
     v2 = repeat_kv(v1, HQ // H)
@@ -1905,7 +1883,8 @@ def test_mixed_attns():
 
     print(f'out diff max:{(out2 - out1).max()}')
     print(f'out diff min:{(out2 - out1).min()}')
-
+    import pdb
+    pdb.set_trace()
     print(f'q grad max: {(q0.grad - q1.grad.transpose(1, 2)).max()}')
     print(f'q grad min: {(q0.grad - q1.grad.transpose(1, 2)).min()}')
 

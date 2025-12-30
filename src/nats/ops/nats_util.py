@@ -67,8 +67,11 @@ def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
                               BT: int,
                               BS: int,
                               NAtS_Block_Size: int,
-                              attn_offset: int
-                              ):
+                                   attn_offset: int,
+                                   n_data_in_current_chunk: int = 0,
+                                   sliding_window_size: int | None = None,
+
+                                   ):
     """
     This function is used to compute how many full iterations we need to compute for each attention workers
     (i_t)
@@ -97,10 +100,16 @@ def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
                                  -1, :]
     else:
         attN_idx_max_in_chunks = nats_chunk_indices[..., attn_offset]
-    m_start = torch.arange(T // BT, device=nats_chunk_indices.device) * BT
-
-    n_iters_per_block = (attN_idx_max_in_chunks.unsqueeze(1) * NAtS_Block_Size < m_start.view(1, -1, 1, 1)).sum(2)
+    m_start = torch.arange(T // BT, device=nats_chunk_indices.device) * BT + n_data_in_current_chunk
+    # If sliding window size is not None, blocks containing the last few sliding_window_size will be ignored in
+    # the first iteration as  we should always query those values
+    if sliding_window_size is not None:
+        n_iters_per_block = (attN_idx_max_in_chunks.unsqueeze(1) * NAtS_Block_Size + sliding_window_size < m_start.view(1, -1, 1, 1)).sum(2)
+    else:
+        n_iters_per_block = (attN_idx_max_in_chunks.unsqueeze(1) * NAtS_Block_Size < m_start.view(1, -1, 1, 1)).sum(2)
     return n_iters_per_block
+
+
 
 
 def compute_starting_idx_for_chunks(
