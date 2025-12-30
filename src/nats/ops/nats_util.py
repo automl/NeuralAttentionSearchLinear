@@ -63,14 +63,13 @@ def prepare_nats_chunk_offsets(
 
 
 def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
-                              T: int,
-                              BT: int,
-                              BS: int,
-                              NAtS_Block_Size: int,
+                                   T: int,
+                                   BT: int,
+                                   BS: int,
+                                   NAtS_Block_Size: int,
                                    attn_offset: int,
-                                   n_data_in_current_chunk: int = 0,
-                                   sliding_window_size: int | None = None,
-
+                                   n_data_in_current_chunk: int=0,
+                                   sliding_window_size:int | None = None,
                                    ):
     """
     This function is used to compute how many full iterations we need to compute for each attention workers
@@ -88,6 +87,10 @@ def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
             nats chunk size
         attn_offset (int):
             attention offset
+        n_data_in_current_chunk (int):
+            number of data in the current chunk.
+        sliding_window_size (int | None):
+            sliding window size
 
     Returns:
 
