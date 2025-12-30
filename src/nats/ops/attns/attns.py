@@ -1607,7 +1607,10 @@ def parallel_attn_nats_bwd(
     BT = min(BT, NAtS_block_size)  # we need to ensure that each BT block only loads one BT
 
     if sliding_window_size is not None or compute_dnats_for_invalid_blocks_attn:
-        grid_kv = grid
+        NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        NV = triton.cdiv(V, BV)
+        grid_kv = (NV, NT, B * HQ)
+
         parallel_attn_bwd_kernel_dkdv_within_valid_blocks[grid_kv](
             q=q, k=k, v=v,
             g_cumsum=g_cumsum, lse=lse, delta=delta,
