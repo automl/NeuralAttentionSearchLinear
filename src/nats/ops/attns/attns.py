@@ -277,7 +277,10 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
         o_q = i_t * BT + tl.arange(0, BT)
 
         for i_iter in tl.range(0, b_n_iters, ):
-            i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
+            if USE_SW:
+                i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
+            else:
+                i_s = i_t * BT + i_iter * BS
             i_nats_block = i_s // NAtS_BLOCK_SIZE
             is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
@@ -587,7 +590,10 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
 
             o_q = i_t * BT + tl.arange(0, BT)
             for i_iter in tl.range(0, b_n_iters, ):
-                i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
+                if USE_SW:
+                    i_s = max((i_t * BT - SW_SIZE), 0) + i_iter * BS
+                else:
+                    i_s = i_t * BT + i_iter * BS
                 i_nats_block = i_s // NAtS_BLOCK_SIZE
                 is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
@@ -1106,15 +1112,16 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
         if STAGE & 1:
             if STAGE == 3:
                 if COMPUTE_PARTIAL_CHUNKS:
-                    lo = i_t0 + BT
+                    lo = i_t0 + BS
                 else:
                     lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
             else:
                 lo = 0
-            n_iters = (T - lo) // BS
+            #n_iters = (T - lo) // BS
+            n_iters = tl.cdiv(T-lo, BS)
             for i_s_ in range(n_iters):
                 i_s = lo + i_s_ * BS
-                i_s = tl.multiple_of(i_s, BS)
+                #i_s = tl.multiple_of(i_s, BS)
                 p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
                 p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
                 p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
@@ -1136,7 +1143,7 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
                     p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
                     b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
                     b_s += b_gq[None, :] - b_gk[:, None]
-                b_p = exp2(b_s - b_lse[None, :])
+                b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
                 # [BT, BS] @ [BS, BV] -> [BT, BV]
                 b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
                 # [BT, BV] @ [BV, BS] -> [BT, BS]
@@ -1150,9 +1157,11 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
 
                 if USE_G:
                     b_dg -= tl.sum(b_ds, 1)
+            """
             hi = tl.cdiv(T - lo, BS) * BS + lo
-            if hi > T:
+            if hi > T and lo < T:
                 i_s = hi - BS
+
                 # the last block with q partially involved
                 p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
                 p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
@@ -1189,6 +1198,7 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
 
                 if USE_G:
                     b_dg -= tl.sum(b_ds, 1)
+            """
 
         b_dk = b_dk * scale
         # we also need to read valuesfrom dk dv
@@ -1564,7 +1574,6 @@ def parallel_attn_nats_bwd(
         0,
         sliding_window_size,
     )
-
     parallel_nats_attn_bwd_kernel_dq[grid](q=q, k=k, v=v,
                                            g_cumsum=g_cumsum, lse=lse, delta=delta,
                                            do=do, dq=dq, dg_cumsum=dg_cumsum,
@@ -1592,8 +1601,8 @@ def parallel_attn_nats_bwd(
                                            OFFSET_ATTN=OFFSET_ATTN,
                                            num_warps=num_warps,
                                            )
-
     # n_grids =prepare_nats_block_indices
+
     BS = triton.cdiv(BT, NAtS_block_size) * BS  # TODO check if this is really beneficial!!!
     BT = min(BT, NAtS_block_size)  # we need to ensure that each BT block only loads one BT
 
