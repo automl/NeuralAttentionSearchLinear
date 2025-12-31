@@ -104,7 +104,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
             g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
             sliding_window_size=attn_sw_size,
-            offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn,
+            offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is not None else False,
             is_causal=True, store_msk=False,
         )
 
@@ -215,7 +215,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             sliding_window_size=ctx.attn_sw_size,
             OFFSET_ATTN=ctx.OFFSET_ATTN,
             compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
-            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn,
+            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn if ctx.attn_sw_size is not None else False,
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
             is_causal=True,

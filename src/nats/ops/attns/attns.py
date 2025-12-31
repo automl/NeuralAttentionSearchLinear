@@ -1112,7 +1112,7 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
         if STAGE & 1:
             if STAGE == 3:
                 if COMPUTE_PARTIAL_CHUNKS:
-                    lo = i_t0 + BS
+                    lo = i_t0 + max(BT, BS)
                 else:
                     lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE
             else:
@@ -1229,54 +1229,54 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
                 b_dk = tl.zeros([BT, BK], dtype=tl.float32)
                 b_dv = tl.zeros([BT, BV], dtype=tl.float32)
 
-            n_iters1 = tl.cdiv(min((BT + SW_SIZE), T - BT), BS)
-            lo, hi = i_t0, min(i_t0 + BT, T)
-            for i_s_ in range(n_iters1):
-                i_s = lo + i_s_ * BS
-                i_s = tl.multiple_of(i_s, BS)
-                p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
-                p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-                p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
-                p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
+                n_iters1 = tl.cdiv(min((BT + SW_SIZE), T - BT), BS)
+                lo, hi = i_t0, min(i_t0 + BT, T)
+                for i_s_ in range(n_iters1):
+                    i_s = lo + i_s_ * BS
+                    i_s = tl.multiple_of(i_s, BS)
+                    p_q = tl.make_block_ptr(q, (T, K), (HQ * K, 1), (i_s, 0), (BS, BK), (1, 0))
+                    p_do = tl.make_block_ptr(do, (T, V), (HQ * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                    p_lse = tl.make_block_ptr(lse, (T,), (HQ,), (i_s,), (BS,), (0,))
+                    p_delta = tl.make_block_ptr(delta, (T,), (HQ,), (i_s,), (BS,), (0,))
 
-                # [BS]
-                o_q = i_s + tl.arange(0, BS)
-                m_q = o_q < T
-                # [BS, BK]
-                b_q = tl.load(p_q, boundary_check=(0, 1))
-                # [BS, BV]
-                b_do = tl.load(p_do, boundary_check=(0, 1))
-                # [BS]
-                b_lse = tl.load(p_lse, boundary_check=(0,))
-                b_delta = tl.load(p_delta, boundary_check=(0,))
-                # [BT, BS]
-                b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
-                if USE_G:
-                    p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
-                    b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
-                    b_s += b_gq[None, :] - b_gk[:, None]
-                m_s = (o_k[:, None] <= o_q[None, :])
-                m_sw = ((o_q[None, :] < o_k[:, None] + SW_SIZE) & m_s)
-
-                b_p = tl.where(m_sw & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
-                b_dp = tl.dot(b_v, tl.trans(b_do))
-                b_ds = b_p * (b_dp - b_delta[None, :])
-                if USE_SW:
-                    # [BT, BS] @ [BS, BV] -> [BT, BV]
-                    b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
-                    # [BT, BV] @ [BV, BS] -> [BT, BS]
+                    # [BS]
+                    o_q = i_s + tl.arange(0, BS)
+                    m_q = o_q < T
+                    # [BS, BK]
+                    b_q = tl.load(p_q, boundary_check=(0, 1))
+                    # [BS, BV]
+                    b_do = tl.load(p_do, boundary_check=(0, 1))
+                    # [BS]
+                    b_lse = tl.load(p_lse, boundary_check=(0,))
+                    b_delta = tl.load(p_delta, boundary_check=(0,))
                     # [BT, BS]
-                    # [BT, BS] @ [BS, BK] -> [BT, BK]
-                    b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
-                if COMPUTE_DNATS_FOR_INVALID_BLCOKS:
-                    b_p1 = tl.where(m_s & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
-                    b_p1 = tl.clamp(b_p1, 0., 1.)
-                    b_ds1 = b_p1 * (b_dp - b_delta[None, :])
-                    b_dattn += tl.sum(
-                        tl.where(m_k[:, None] & o_q > load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE, b_ds1, 0)
-                    )
-                if USE_G:
-                    b_dg -= tl.sum(b_ds, 1)
+                    b_s = tl.dot(b_k, tl.trans(b_q)) * qk_scale
+                    if USE_G:
+                        p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+                        b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+                        b_s += b_gq[None, :] - b_gk[:, None]
+                    m_s = (o_k[:, None] <= o_q[None, :])
+                    m_sw = ((o_q[None, :] < o_k[:, None] + SW_SIZE) & m_s)
+
+                    b_p = tl.where(m_sw & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                    b_dp = tl.dot(b_v, tl.trans(b_do))
+                    b_ds = b_p * (b_dp - b_delta[None, :])
+                    if USE_SW:
+                        # [BT, BS] @ [BS, BV] -> [BT, BV]
+                        b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+                        # [BT, BV] @ [BV, BS] -> [BT, BS]
+                        # [BT, BS]
+                        # [BT, BS] @ [BS, BK] -> [BT, BK]
+                        b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+                    if COMPUTE_DNATS_FOR_INVALID_BLCOKS:
+                        b_p1 = tl.where(m_s & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+                        b_p1 = tl.clamp(b_p1, 0., 1.)
+                        b_ds1 = b_p1 * (b_dp - b_delta[None, :])
+                        b_dattn += tl.sum(
+                            tl.where(m_k[:, None] & o_q > load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE, b_ds1, 0)
+                        )
+                    if USE_G:
+                        b_dg -= tl.sum(b_ds, 1)
             if USE_SW:
                 p_dk = tl.make_block_ptr(dk + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t0, 0), (BT, BK), (1, 0))
                 p_dv = tl.make_block_ptr(dv + (bos * HQ + i_hq) * V, (T, V), (HQ * V, 1), (i_t0, i_v * BV), (BT, BV),
@@ -1288,7 +1288,11 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
             if COMPUTE_DNATS_FOR_INVALID_BLCOKS:
 
                 if STAGE == 3:
-                    lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE + SW_SIZE
+                    #lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE + SW_SIZE
+                    if USE_SW:
+                        lo = i_t0 + n_iters1 * BT
+                    else:
+                        lo = load_idx_chunk * NAtS_BLOCK_SIZE + NAtS_BLOCK_SIZE + SW_SIZE
                 else:
                     lo = 0
                 n_iters = (T - lo) // BS
@@ -1859,7 +1863,7 @@ def test_mixed_attns():
     # TODO move this to tests!
     torch.manual_seed(0)
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-    dtype = torch.float16
+    #dtype = torch.float16
 
     import math
     import copy
@@ -1916,7 +1920,9 @@ def test_mixed_attns():
                                    NAtS_block_size=NATS_Chunk,
                                    store_msk=True
                                    )
-    loss = (out1 ** 2).sum()
+    target = torch.rand_like(out1)
+    loss = ((out1 - target) ** 2).sum()
+    #loss = (out1 ** 2).sum()
     loss.backward()
 
     q1 = copy.deepcopy(q.detach()).view(BATCH, T, HQ * GATTN, D_HEAD // GATTN).transpose(1, 2)
@@ -1984,7 +1990,8 @@ def test_mixed_attns():
     k2 = repeat_kv(k1, HQ // H)
     v2 = repeat_kv(v1, HQ // H)
     out2 = torch.nn.functional.scaled_dot_product_attention(q1, k2, v2, mask_.bool())
-    loss2 = (out2 ** 2).sum()
+    loss2 = ((target-out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)) ** 2).sum()
+    #loss2 = (out2**2).sum()
     loss2.backward()
 
     out2 = out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)
