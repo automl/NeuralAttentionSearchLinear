@@ -103,7 +103,7 @@ def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
                                  -1, :]
     else:
         attN_idx_max_in_chunks = nats_chunk_indices[..., attn_offset]
-    m_start = torch.arange(T // BT, device=nats_chunk_indices.device) * BT + n_data_in_current_chunk
+    m_start = torch.arange(triton.cdiv(T, BT), device=nats_chunk_indices.device) * BT + n_data_in_current_chunk
     # If sliding window size is not None, blocks containing the last few sliding_window_size will be ignored in
     # the first iteration as  we should always query those values
     if sliding_window_size is not None:
@@ -111,8 +111,6 @@ def compute_attn_n_iters_per_block(nats_chunk_indices: torch.Tensor,
     else:
         n_iters_per_block = (attN_idx_max_in_chunks.unsqueeze(1) * NAtS_Block_Size < m_start.view(1, -1, 1, 1)).sum(2)
     return n_iters_per_block
-
-
 
 
 def compute_starting_idx_for_chunks(
@@ -150,7 +148,7 @@ def compute_starting_idx_for_chunks(
                                  -1, :]
     else:
         attN_idx_max_in_chunks = nats_block_indices[..., offset_op]
-    m_start = torch.arange(T // BT, device=nats_block_indices.device) * BT
+    m_start = torch.arange(triton.cdiv(T, BT), device=nats_block_indices.device) * BT
 
     n_iters_per_block = (attN_idx_max_in_chunks.unsqueeze(1) * NAtS_Block_Size < m_start.view(1, -1, 1, 1)).sum(2)
     return n_iters_per_block

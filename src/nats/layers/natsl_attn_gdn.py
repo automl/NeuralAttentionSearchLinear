@@ -18,11 +18,14 @@ from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution, RotaryEmbe
 from fla.ops.utils.index import prepare_lens_from_mask
 from fla.ops.utils.pooling import mean_pooling
 
-# from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-#from nats.ops.attns.attns import parallel_mixed_attn
-#from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
-from nats.ops.mixed_ops.mixed_attn_gdn import nats_mixed_attn_gdn
+
+from nats.ops.mixed_ops.mixed_attn_gdn import (
+    nats_mixed_attn_gdn_recurrent,
+    nats_mixed_attn_gdn_chunk_inference,
+    nats_mixed_attn_gdn
+)
 from nats.modules.fused_norm_gate import FusedMultiInputRMSNormGated
+from nats.models.utils import NAtSLayerCache
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -314,7 +317,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             self,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[Cache] = None, # TODO write a new cache management!!!
+            past_key_values: Optional[Cache] = None,
             use_cache: Optional[bool] = False,
             output_attentions: Optional[bool] = False,
             **kwargs: Unpack[Dict]
@@ -327,38 +330,44 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             )
         batch_size, q_len, dim = hidden_states.shape
         # change to inference mode.
-        mode = 'fused_recurrent' if q_len <= 64 else self.mode
+        mode = 'fused_recurrent' if q_len < 64 else self.mode
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
-        last_state = None
+        nats_cache: NAtSLayerCache | None = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
-            last_state = past_key_values[self.layer_idx]
+            nats_cache = past_key_values[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens', None)
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
         # TODO we need our own fun here...
-        hs_reduced = self.pooling_func(
-            hidden_states.view(batch_size, q_len, 1, dim),
-            chunk_size=self.nats_block_size,
-            cu_seqlens=cu_seqlens
-        )
-        hs_reduced = hs_reduced.view(batch_size, hs_reduced.shape[1], dim)
-        nats_op_types = self.nats_layer(hs_reduced)
-        nats_op_logits = rearrange(nats_op_types,  '... (h d) -> ... h d', d=self.n_ops)
-        nats_op_types = self.nats_sample_func(nats_op_logits)
-        # The last block is set 1 for all the operations. This does not influence the output values
-        nats_op_types[:,-1] = 1
-        n_nats_blocks = nats_op_types.int().sum(1)
-        self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
+        if nats_cache is not None:
+            nats_layer_input = nats_cache.update_attn_types(input_hidden_states=hidden_states)
+        else:
+            nats_layer_input = hidden_states
+            self.nats_layer_input = nats_layer_input
+        if nats_layer_input is not None:
+            hs_reduced = self.pooling_func(
+                nats_layer_input.unsqueeze(-2),
+                chunk_size=self.nats_block_size,
+                cu_seqlens=cu_seqlens
+            )
+            hs_reduced = hs_reduced.view(batch_size, hs_reduced.shape[1], dim)
+            nats_op_types = self.nats_layer(hs_reduced)
+            nats_op_logits = rearrange(nats_op_types,  '... (h d) -> ... h d', d=self.n_ops)
+            nats_op_types = self.nats_sample_func(nats_op_logits)
+            # The last block is set 1 for all the operations. This does not influence the output values
+        else:
+            nats_op_types = torch.ones(batch_size, 1, self.num_nats_head, self.n_ops,
+                                       device=hidden_states.device,dtype=hidden_states.dtype)
 
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if self.attn_with_short_conv:
-                if last_state is not None:
-                    conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
+                if nats_cache is not None:
+                    conv_state_q, conv_state_k, conv_state_v = nats_cache.conv_state
                 q, conv_state_q = self.q_conv1d(
                     x=self.q_proj(hidden_states),
                     cache=conv_state_q,
@@ -427,7 +436,6 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         
         q_attn, k_attn = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_attn_k_dim), (q_attn, k_attn))
         v_attn = rearrange(v_attn, '... (h d) -> ... h d', d=self.head_attn_v_dim)
-        # TODO grouped QKV for attns...
 
         if self.num_v_heads > self.num_heads:
             q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
@@ -460,8 +468,23 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
 
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
-        recurrent_state_gated_delta = last_state['recurrent_state_gated_delta'] if last_state is not None else None
-        if mode == 'chunk':
+        if nats_cache is not None:
+            nats_op_types_raw = nats_op_types.clone()
+            k_attn, v_attn = nats_cache.update_attn_cache((k_attn, v_attn), nats_block_types=nats_op_types_raw,)
+            k, v = nats_cache.update_lattn_cache((k,v), mode, self.ops_for_incomplete_chunks)
+            recurrent_state_gdn_block_start = nats_cache.recurrent_state_block_start
+            recurrent_state_gated_delta = nats_cache.recurrent_state
+            g_cumsum = nats_cache.g_cumsum
+        else:
+            recurrent_state_gated_delta = None
+            recurrent_state_gdn_block_start = None
+            g_cumsum = 0
+
+        if mode == 'chunk' and self.training:
+            # TODO start with partial gated delta sates?
+            nats_op_types[:, -1] = 1
+            n_nats_blocks = nats_op_types.int().sum(1)
+            self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
             o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn_gdn(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
@@ -481,18 +504,73 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
+            recurrent_state_gdn_block_start = None
+        elif mode == 'chunk' and self.eval():
+            t_k = k.shape[1]
+            if t_k % self.nats_block_size == 0:
+                op_type_last_chunk = nats_op_types[:, -1].clone()
+            else:
+                op_type_last_chunk = None
+            nats_op_types[:, -1] = 1
+            n_nats_blocks = nats_op_types.int().sum(1)
+            o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_chunk_inference(
+                q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                q_lattn=q, k_lattn=k, v_lattn=v,
+                initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
+                g=g, beta=beta,
+                nats_block_types=nats_op_types,
+                op_type_last_chunk=op_type_last_chunk,
+                n_nats_blocks=n_nats_blocks,
+                scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
+                nats_block_size=self.nats_block_size,
+                ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
+                output_final_state_gated_delta=use_cache,
+                incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
+                use_g_for_attn=self.usg_for_attn,
+                lattn_use_qk_l2norm_in_kernel=True,
+            )
         elif mode == 'fused_recurrent':
-            raise NotImplementedError
+            # we first start with the attn output
+            if q_len == 1:
+                attn_msk = nats_cache.generate_msk(n_data= q_len)
+                # recurrent_state_gated_delta_ = recurrent_state_gated_delta.clone()
+                o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_recurrent(
+                    q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                    q_lattn=q, k_lattn=k, v_lattn=v,
+                    attn_msk=attn_msk,
+                    initial_state_gated_delta=recurrent_state_gated_delta,
+                    initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
+                    g=g, g_cumsum=g_cumsum, beta=beta,
+                    nats_block_types=nats_op_types,
+                    n_tokens_in_current_block=nats_cache._n_tokens_in_nats_block if nats_cache is not None else 0,
+                    scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                    cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
+                    nats_block_size=self.nats_block_size,
+                    ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
+                    output_final_state_gated_delta=use_cache,
+                    incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                    decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
+                    use_g_for_attn=self.usg_for_attn,
+                    lattn_use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                raise NotImplementedError
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        if past_key_values is not None:
+        if nats_cache is not None:
             # TODO this needs to be updated!!!
-            past_key_values.update(
+            nats_cache.update(
                 recurrent_state=recurrent_state_gated_delta,
+                recurrent_state_block_start=recurrent_state_gdn_block_start,
+                attn_state=(k_attn, v_attn),
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
-                layer_idx=self.layer_idx,
-                offset=q_len
+                nats_block_types=nats_op_types_raw,
+                l_attn_state=(k, v),
+                g=g,
+                n_new_tokens=q_len
             )
 
         if self.use_gate:
@@ -521,24 +599,42 @@ def test_mixed_attn():
     from torch.nn import functional as F
 
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
+    ops_for_incomplete_chunks='all'
 
-    layer = NeuralAttentionSearchLinearAttnGDN(hidden_size=512, head_dim=64, num_heads=2, num_attn_heads=4,
-                                        expand_v=1,
-                                        ops_for_incomplete_chunks='all',
+    layer = NeuralAttentionSearchLinearAttnGDN(hidden_size=1024, head_dim=128, num_heads=6, num_attn_heads=12,
+                                        expand_v=2,
+                                        ops_for_incomplete_chunks=ops_for_incomplete_chunks,
                                         use_short_conv=False,
-                                               outputs_are_wighted=True,
-                                        compute_dnats_for_invalid_blocks_linear_att=False,
-                                        compute_dnats_for_invalid_blocks_attn=False,
-                                               attn_qk_norm=True,
-                                               attn_with_short_conv=True,
+                                        outputs_are_wighted=True,
+                                       attn_qk_norm=True,
+                                       attn_with_short_conv=True,
+                                       layer_idx=0,
+                                               decay_for_non_gdn_blocks=True,
+                                        ).cuda().to(dtype=dtype)
+    layer = layer.eval()
+    nt = 4094
+    #nt = 534
+    input_data = torch.randn((2, nt, 1024)).cuda().to(dtype=dtype)
+    out1 = layer(input_data)[0]
 
-                                        ).cuda()
-    input_data = torch.randn((2, 512, 512)).cuda()
-    out = layer(input_data)[0]
-    label = torch.rand_like(out)
+    cache = [NAtSLayerCache(op_for_incomplete_chunk=ops_for_incomplete_chunks)]
+    out2 = torch.empty_like(out1).to(dtype=dtype)
+    #nt2 = 256
+    nt2=85
+    nt1 = nt-nt2
 
-    loss = ((out - label)**2).sum()
-    loss.backward()
+    out21, _, cache = layer(input_data[:, :nt1], past_key_values=cache, use_cache=True)
+
+    out2[:,:nt1] = out21
+
+    from tqdm import tqdm
+    for i in tqdm(range(nt2)):
+        o_current, _ , cache = layer(input_data[:, [nt1+i]],  past_key_values=cache, use_cache=True)
+
+        out2[:, [nt1+i]] = o_current
+
+    diff = out2 - out1
+
     import pdb
     pdb.set_trace()
 

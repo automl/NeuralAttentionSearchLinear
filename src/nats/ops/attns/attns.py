@@ -80,6 +80,8 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                                   BS: tl.constexpr,
                                   BK: tl.constexpr,
                                   BV: tl.constexpr,
+                                  STRIDE_KB: tl.constexpr,
+                                  STRIDE_VB: tl.constexpr,
                                   NAtS_BLOCK_SIZE: tl.constexpr,
                                   SW_SIZE:tl.constexpr,
                                   N_TYPES: tl.constexpr,
@@ -113,6 +115,9 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
 
         n_iters_per_block = n_iters_per_block + i_n * tl.cdiv(T, BT) * HNAtS + i_hnats
         b_n_iters = tl.load(n_iters_per_block + i_t * HNAtS).to(tl.int32)
+
+        k += (bos * HKV + i_h) * K
+        v += (bos * HKV + i_h) * V + i_v * BV
     else:
         i_n = i_b
         bos, eos = i_n * T, i_n * T + T
@@ -123,8 +128,8 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
         n_iters_per_block = n_iters_per_block + i_n * tl.cdiv(T, BT) * HNAtS + i_hnats
         b_n_iters = tl.load(n_iters_per_block + i_t * HNAtS).to(tl.int32)
 
-    k += (bos * HKV + i_h) * K
-    v += (bos * HKV + i_h) * V + i_v * BV
+        k += i_n * STRIDE_KB + i_h * K
+        v += i_n * STRIDE_VB + i_h * V + i_v * BV
     if STORE_MSK:
         msk += (i_b * HQ + i_hq).to(tl.int64) * T * T
 
@@ -172,7 +177,6 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
         else:
             lo = 0
             hi = T
-
         # loop over k, v and update accumulator
         # for i_s in tl.range(lo, hi, BS, ):
         for i_iter in tl.range(0, b_n_iters, ):
@@ -208,8 +212,9 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
                 b_mp = b_m
                 if STORE_MSK:
-                    p_msk = tl.make_block_ptr(msk, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (0, 1))
-                    tl.store(p_msk, (tl.zeros([BT, BS], dtype=tl.float32) + 1).to(p_msk.dtype.element_ty))
+                    p_msk = tl.make_block_ptr(msk, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (1, 0))
+                    tl.store(p_msk, (tl.zeros([BT, BS], dtype=tl.float32) + 1).to(p_msk.dtype.element_ty),
+                             boundary_check=(0,1))
 
         if (NAtS_BLOCK_SIZE > BT and COMPUTE_PARTIAL_CHUNKS) or STAGE == 1:
             # In this case, there is a chance that we need to compute an incomplete nats chunk
@@ -273,7 +278,6 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
             b_n_iters = tl.cdiv(min(BT + min(i_t*BT, SW_SIZE), T - i_t * BT + SW_SIZE), BS)
         else:
             b_n_iters = tl.cdiv(min(BT, T - i_t * BT) - NAtS_BLOCK_SIZE, BS)
-
         o_q = i_t * BT + tl.arange(0, BT)
 
         for i_iter in tl.range(0, b_n_iters, ):
@@ -285,7 +289,7 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
             is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
             if COMPUTE_PARTIAL_CHUNKS or is_attn_block:
-                p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (0, 1))
+                p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (1, 0))
                 p_v = tl.make_block_ptr(v, (T, V), (stride_vt, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
 
                 # [BS]
@@ -314,10 +318,9 @@ def parallel_nats_attn_fwd_kernel(q, k, v, o,  # Q, O are of shape [B, T, H, DQ]
                 else:
                     m_s = (o_q[:, None] >= ((i_nats_block + 1) * NAtS_BLOCK_SIZE)) & m_k[None, :]
                     rows_are_valid = tl.full((BT,), value=1, dtype=tl.int1)
-
                 if STORE_MSK:
-                    p_msk = tl.make_block_ptr(msk, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (0, 1))
-                    tl.store(p_msk, tl.broadcast_to(m_s, [BT, BS]).to(p_msk.dtype.element_ty))
+                    p_msk = tl.make_block_ptr(msk, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (1, 0))
+                    tl.store(p_msk, tl.broadcast_to(m_s, [BT, BS]).to(p_msk.dtype.element_ty), boundary_check=(0, 1))
 
                 b_s = tl.where(m_s, b_s, float('-inf'))
                 # [BT]
@@ -366,7 +369,7 @@ def parallel_attn_bwd_kernel_preprocess(
     b_do = tl.load(p_do + i_n * V + o_d, mask=m_d, other=0).to(tl.float32)
     b_delta = tl.sum(b_o * b_do)
 
-    tl.store(p_delta + i_n, b_delta.to(p_delta.dtype.element_ty))
+    tl.store(p_delta + i_n, b_delta.to(p_delta.dtype.element_ty), )
 
 
 @triton.heuristics({
@@ -570,8 +573,8 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                             p_dk = tl.make_block_ptr(dk, (T, K), (stride_kt, 1), (i_s, 0), (BS, BK), (1, 0))
                             p_dv = tl.make_block_ptr(dv, (T, V), (stride_vt, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
 
-                            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty))
-                            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty))
+                            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
+                            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
 
                         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
                         if USE_G:
@@ -1389,7 +1392,7 @@ def parallel_attn_nats_fwd(
         is_causal=True,
         store_msk: bool = False,
 ):
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T , H, K, V = *k.shape, v.shape[-1]
 
     TNAtS, HNAtS, N_TYPES = nats_block_types.shape[1:]
     HQ = q.shape[2]
@@ -1469,6 +1472,8 @@ def parallel_attn_nats_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        STRIDE_KB=k.stride(0),
+        STRIDE_VB=v.stride(0),
         NAtS_BLOCK_SIZE=NAtS_block_size,
         SW_SIZE=sliding_window_size,
         STAGE=stage,
@@ -1770,7 +1775,7 @@ def parallel_nats_attn(
         n_nats_blocks: torch.Tensor,
         scale, cu_seqlens=None, cu_seqlens_nats=None,
         NAtS_block_size: int = 64,
-        sliding_window_size: int=64,
+        sliding_window_size: int| None = None,
         offset_attn: int = 0,
         compute_incomplete_chunk_scores: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool=False,
@@ -1871,7 +1876,8 @@ def test_mixed_attns():
     HQ = 4
     H = 2
     HAttns = 2
-    T = 512
+    T = 4135
+    #T = 573
     D_HEAD = 64
     GATTN = 1
     N_OPTs = 3
@@ -1904,8 +1910,8 @@ def test_mixed_attns():
     v0 = torch.nn.Parameter(v0, requires_grad=True)
     attn_types_ = torch.nn.Parameter(attn_types, requires_grad=True)
 
-    compute_incomplete_chunk_scores = False
-    sliding_window_size=64
+    compute_incomplete_chunk_scores = True
+    sliding_window_size=None
 
     out1, msk = parallel_nats_attn(q0.view(BATCH, T, HQ * GATTN, D_HEAD // GATTN),
                                    k0.view(BATCH, T, H * GATTN, D_HEAD // GATTN),
@@ -1923,7 +1929,7 @@ def test_mixed_attns():
     target = torch.rand_like(out1)
     loss = ((out1 - target) ** 2).sum()
     #loss = (out1 ** 2).sum()
-    loss.backward()
+    #loss.backward()
 
     q1 = copy.deepcopy(q.detach()).view(BATCH, T, HQ * GATTN, D_HEAD // GATTN).transpose(1, 2)
     k1 = copy.deepcopy(k.detach()).view(BATCH, T, H * GATTN, D_HEAD // GATTN).transpose(1, 2)
@@ -1978,26 +1984,29 @@ def test_mixed_attns():
         mask_sw =  (torch.arange(T)[:, None] >= (torch.arange(T)[None, :])).cuda()
         #mask_sw = mask_sw & (torch.arange(T)[None,:]+sliding_window_size > torch.arange(T)[:, None]).cuda()
         mask_sw = mask_sw & (torch.arange(T)[:, None]-sliding_window_size < (torch.arange(T)[None, :])).cuda()
-        mask_ = mask_ + mask_sw.view(1, 1, T, T).to(mask_)
+        mask_ = mask_[:,:,:,:T] + mask_sw.view(1, 1, T, T).to(mask_)
     elif compute_incomplete_chunk_scores:
         # mask_diag =
         mask_diag = (torch.arange(0, NATS_Chunk, device=device)[:, None] >= torch.arange(0, NATS_Chunk, device=device))
-        mask_diag = torch.block_diag(*[mask_diag for _ in range(TNAtS)])
-        mask_ = mask_ + mask_diag.view(1, 1, T, T).to(mask_)
+        mask_diag = torch.block_diag(*[mask_diag for _ in range(TNAtS)])[:T,:T]
+        mask_ = mask_[...,:T] + mask_diag.view(1, 1, T, T).to(mask_)
 
-    mask_ = repeat_masks(mask_, HQ // HAttns).bool().to(msk)
+    mask_ = repeat_masks(mask_[...,:T], HQ // HAttns).bool().to(msk)
 
     k2 = repeat_kv(k1, HQ // H)
     v2 = repeat_kv(v1, HQ // H)
     out2 = torch.nn.functional.scaled_dot_product_attention(q1, k2, v2, mask_.bool())
     loss2 = ((target-out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)) ** 2).sum()
     #loss2 = (out2**2).sum()
-    loss2.backward()
+    #loss2.backward()
 
     out2 = out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)
 
     print(f'out diff max:{(out2 - out1).max()}')
     print(f'out diff min:{(out2 - out1).min()}')
+
+    import pdb
+    pdb.set_trace()
     print(f'q grad max: {(q0.grad - q1.grad.transpose(1, 2)).max()}')
     print(f'q grad min: {(q0.grad - q1.grad.transpose(1, 2)).min()}')
 

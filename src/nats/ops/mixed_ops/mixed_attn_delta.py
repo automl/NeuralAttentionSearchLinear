@@ -3,7 +3,6 @@ import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous, input_guard
-from fla.ops.utils.cumsum import chunk_global_cumsum
 
 from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd
 from nats.ops.delta_rule.chunk import chunk_delta_rule_nats_fwd, chunk_delta_rule_nats_bwd
