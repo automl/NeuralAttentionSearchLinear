@@ -6,7 +6,10 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous, inpu
 from fla.ops.utils.cumsum import chunk_global_cumsum
 
 from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd
+from nats.ops.attns.attn_utils import repeat_masks
 from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
+from nats.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_nats_inference_fwd
+from nats.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule
 
 from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, compute_starting_idx_for_chunks
 
@@ -104,7 +107,7 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
             q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
             g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
             sliding_window_size=attn_sw_size,
-            offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is not None else False,
+            offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
             is_causal=True, store_msk=False,
         )
 
@@ -306,6 +309,249 @@ def nats_mixed_attn_gdn(
         use_g_for_attn, lattn_use_qk_l2norm_in_kernel
     )
     return o_gated_delta_net, o_attn, gated_delta_ht
+
+
+def nats_mixed_attn_gdn_chunk_inference(
+        q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
+        q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
+        initial_state_gated_delta_chunk_start: torch.Tensor, # TODO this should also be hte part
+        g: torch.Tensor,
+        #g_cumsum: torch.Tensor, # TODO do we need this?
+        beta: torch.Tensor,
+        nats_block_types: torch.Tensor,
+        op_type_last_chunk: torch.Tensor | None,
+        n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
+        n_tokens_in_current_block:int = 0,
+        scale_attn=None, scale_lattn=None,
+        cu_seqlens=None, cu_seqlens_nats=None,
+        nats_block_size: int = 64,
+        attn_sw_size: int | None = None,
+        ops_for_incomplete_chunks: str = 'gated_delta_net',
+        output_final_state_gated_delta: bool = False,
+        decay_for_non_gdn_blocks:bool=False,
+        incomplete_block_start_with_ht: bool = True,
+        use_g_for_attn: bool = False,
+        lattn_use_qk_l2norm_in_kernel: bool = True,
+):
+    incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
+    if scale_attn is None:
+        scale_attn = k_attn.shape[-1] ** -0.5
+    if scale_lattn is None:
+        scale_lattn = k_lattn.shape[-1] ** -0.5
+
+    if incomplete_block_strategy.gated_delta_net:
+        keep_wu_as_kv = True
+    else:
+        keep_wu_as_kv = False
+
+    TNAtS = nats_block_types.shape[1]
+    T = q_lattn.shape[1]
+    nats_block_indices = torch.where(
+        nats_block_types == 1.,
+        torch.arange(TNAtS, device=nats_block_types.device, dtype=torch.int32).view(1, -1, 1, 1), TNAtS
+    )
+    nats_block_indices = nats_block_indices.sort(1)[0]
+
+    if n_nats_blocks is None:
+        n_nats_blocks = nats_block_types.int().sum(1)
+    if use_g_for_attn:
+        RCP_LN2: float = 1.4426950216
+        g_cumsum_attn = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
+    else:
+        g_cumsum_attn = None
+
+    # TODO make this a dict? check if it can pass torch compile's check
+    OFFSET_ATTN = 0
+    OFFSET_GATED_DELTA_NET = 1
+
+    # attns
+
+    o_attn, lse_attn, msk = parallel_attn_nats_fwd(
+        q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
+        g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
+        sliding_window_size=attn_sw_size,
+        offset_attn=OFFSET_ATTN,
+        compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
+        is_causal=True, store_msk=True,
+    )
+
+    # gated delta net
+    if lattn_use_qk_l2norm_in_kernel:
+        q_lattn, q_rstd_lattn = l2norm_fwd(q_lattn)
+        k_lattn, k_rstd_lattn = l2norm_fwd(k_lattn)
+    else:
+        q_rstd_lattn, k_rstd_lattn = None, None
+
+    chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_GATED_DELTA_NET],
+                                                          nats_block_size,
+                                                          CHUNK_SIZE, )
+    nats_block_delta_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
+                                                          nats_block_types,
+                                                          nats_block_size,
+                                                          CHUNK_SIZE, OFFSET_GATED_DELTA_NET)
+
+    starting_h_idx_gated_delta = compute_starting_idx_for_chunks(
+        nats_block_indices=nats_block_indices,
+        T=T,
+        BT=CHUNK_SIZE,
+        NAtS_Block_Size=nats_block_size,
+        offset_op=OFFSET_GATED_DELTA_NET
+    )
+
+    o_gated_delta_net, gdn_final_state, gdn_chunk_start = chunk_gated_delta_rule_nats_inference_fwd(
+        q=q_lattn,
+        k=k_lattn,
+        v=v_lattn,
+        g=g,
+        beta=beta,
+        nats_block_types=nats_block_types,
+        op_type_last_chunk=op_type_last_chunk,
+        nats_block_indices=nats_block_indices,
+        n_nats_blocks=n_nats_blocks,
+        scale=scale_lattn,
+        initial_state=initial_state_gated_delta_chunk_start,
+        output_final_state=output_final_state_gated_delta,
+        chunk_indices_delta_nats=chunk_indices_delta_nats,
+        nats_block_delta_offsets=nats_block_delta_offsets,
+        starting_h_idx_delta=starting_h_idx_gated_delta,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_nats=cu_seqlens_nats,
+        nats_block_size=nats_block_size,
+        offset_delta=OFFSET_GATED_DELTA_NET,
+        compute_incomplete_chunk_scores=incomplete_block_strategy.gated_delta_net,
+        incomplete_block_start_with_ht=incomplete_block_start_with_ht,
+        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+        keep_wu_as_kv=keep_wu_as_kv,
+    )
+    return o_gated_delta_net, o_attn, gdn_final_state, gdn_chunk_start
+
+
+def nats_mixed_attn_gdn_recurrent(
+        q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
+        q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
+        attn_msk: torch.Tensor,
+        initial_state_gated_delta: torch.Tensor,
+        initial_state_gated_delta_chunk_start: torch.Tensor,
+        g: torch.Tensor,
+        g_cumsum: torch.Tensor,
+        beta: torch.Tensor,
+        nats_block_types: torch.Tensor,
+        n_tokens_in_current_block:int = 0,
+        scale_attn=None, scale_lattn=None,
+        cu_seqlens=None, cu_seqlens_nats=None,
+        nats_block_size: int = 64,
+        attn_sw_size: int | None = None,
+        ops_for_incomplete_chunks: str = 'gated_delta_net',
+        output_final_state_gated_delta: bool = False,
+        decay_for_non_gdn_blocks:bool=False,
+        incomplete_block_start_with_ht: bool = True,
+        use_g_for_attn: bool = False, # TODO this is also required!!!
+        lattn_use_qk_l2norm_in_kernel: bool = True,
+):
+    # TODO consider the case where decay still happens with inactivate gdn blocks!
+    if scale_attn is None:
+        scale_attn = k_attn.shape[-1] ** -0.5
+    if scale_lattn is None:
+        scale_lattn = k_lattn.shape[-1] ** -0.5
+
+    attn_msk = repeat_masks(attn_msk, q_attn.shape[2] // attn_msk.shape[1])
+
+    incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
+
+    OFFSET_ATTN = 0
+    OFFSET_GATED_DELTA_NET = 1
+    o_attn = torch.nn.functional.scaled_dot_product_attention(
+        q_attn.transpose(1,2), k_attn.transpose(1,2), v_attn.transpose(1,2), attn_mask=attn_msk, scale=scale_attn
+    ).transpose(1,2).contiguous()
+
+    if incomplete_block_strategy.gated_delta_net:
+        # in this case, we simply do a one step recurrent fwd
+        o_gated_delta_net, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule(
+            q_lattn, k_lattn, v_lattn, g=g, g_cumsum=g_cumsum,
+            beta=beta,
+            nats_block_types=nats_block_types,
+            n_tokens_in_current_block=n_tokens_in_current_block,
+            scale=scale_lattn,
+            initial_state=initial_state_gated_delta,
+            initial_state_current=initial_state_gated_delta_chunk_start,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            nats_block_size=nats_block_size,
+            offset_op=OFFSET_GATED_DELTA_NET,
+            decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+            output_final_state=True,
+            update_hs_for_each_iter=True,
+            use_qk_l2norm_in_kernel=lattn_use_qk_l2norm_in_kernel,
+        )
+    else:
+        n_tokens_first = nats_block_size - n_tokens_in_current_block
+        # in this case, we first directly compute Q out
+        o_gated_delta_net = torch.empty(*q_lattn.shape[:2], *v_lattn.shape[2:], device=v_lattn.device, dtype=q_lattn.dtype)
+        o_gated_delta_net[:, :n_tokens_first] = fused_recurrent_gated_delta_rule(
+            q_lattn[:, :n_tokens_first], k_lattn, v_lattn, g=g[:, nats_block_size:n_tokens_first].contiguous() + g_cumsum,
+            beta=beta,
+            nats_block_types=nats_block_types,
+            n_tokens_in_current_block=n_tokens_in_current_block,
+            scale=scale_lattn,
+            initial_state=initial_state_gated_delta,
+            initial_state_current=initial_state_gated_delta_chunk_start,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_nats=cu_seqlens_nats,
+            nats_block_size=nats_block_size,
+            offset_op=OFFSET_GATED_DELTA_NET,
+            decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        # we now use parallel form to update the hidden states
+        n_iters = (n_tokens_in_current_block + q_lattn.shape[1]) // nats_block_size
+        for i in range(n_iters):
+            i_start = i * nats_block_size
+            i_end = (i + 1) * nats_block_size
+            _, final_state, incomplete_block_strategy = chunk_gated_delta_rule_nats_inference_fwd(
+                q=None, k=k_lattn[:, i_start:i_end].contiguous(), v=v_lattn[:, i_start:i_end].contiguous(),
+                g=g[:, i_start:i_end].contiguous(), beta=beta[:,i_start:i_end].contiguous(),
+                nats_block_types=nats_block_types[:, [i]].contiguous(),
+                output_final_state=output_final_state_gated_delta,
+                offset_delta=OFFSET_GATED_DELTA_NET,
+                compute_incomplete_chunk_scores=False,
+                incomplete_block_start_with_ht=incomplete_block_start_with_ht, keep_wu_as_kv=False,
+                n_tokens_in_init_chunk=0, compute_o=False
+            )
+            i_q_start = (i + 1) * nats_block_size - n_tokens_in_current_block
+            i_q_end = (i + 2) * nats_block_size - n_tokens_in_current_block
+            o_gated_delta_net[:, i_q_start:i_q_end] = fused_recurrent_gated_delta_rule(
+                q_lattn[:, i_q_start:i_q_end].contiguous(), k_lattn, v_lattn,
+                g=g[:, i_q_start:i_q_end].contiguous(),
+                beta=beta,
+                nats_block_types=nats_block_types,
+                n_tokens_in_current_block=n_tokens_in_current_block,
+                scale=scale_lattn,
+                initial_state=initial_state_gated_delta,
+                initial_state_current=initial_state_gated_delta_chunk_start,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_nats=cu_seqlens_nats,
+                nats_block_size=nats_block_size,
+                offset_op=OFFSET_GATED_DELTA_NET,
+                decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+        if (n_tokens_in_current_block + q_lattn.shape[1]) % nats_block_size == 0:
+            i_start = n_tokens_in_current_block + q_lattn.shape[1] - nats_block_size
+            # we need to update the final state for the last time:
+            _, final_state, initial_state_in_current_block = chunk_gated_delta_rule_nats_inference_fwd(
+                q=None, k=k_lattn[:, i_start:].contiguous(), v=v_lattn[:, i_start:].contiguous(),
+                g=g[:, i_start:].contiguous(), beta=beta[:, i_start:].contiguous(),
+                nats_block_types=nats_block_types[:, [-1]].contiguous(),
+                offset_delta=OFFSET_GATED_DELTA_NET,
+                compute_incomplete_chunk_scores=False,
+                incomplete_block_start_with_ht=incomplete_block_start_with_ht, keep_wu_as_kv=False,
+                n_tokens_in_init_chunk=0, compute_o=False
+            )
+    return o_gated_delta_net, o_attn, final_state, initial_state_in_current_block
+
+
 
 
 def test_mixed_attn():

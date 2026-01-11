@@ -63,6 +63,7 @@ def chunk_fwd_kernel_o(
         NAtS_BLOCK_SIZE: tl.constexpr,
         N_TYPES: tl.constexpr,
         OFFSET_OP: tl.constexpr,
+        N_TOKENS_IN_INIT_CHUNK: tl.constexpr,
         COMPUTE_INCOMPLETE_BLOCK_SCORES: tl.constexpr,
         DECAY_FOR_NON_GDN_BLOCKS:tl.constexpr,
         WV_ARE_FLATTENED: tl.constexpr,
@@ -148,7 +149,7 @@ def chunk_fwd_kernel_o(
             b_v_updated = tl.zeros([BT, BV], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT - N_TOKENS_IN_INIT_CHUNK, i_k * BK), (BT, BK), (1, 0))
 
         # p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
         p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
@@ -1192,6 +1193,7 @@ def chunk_fwd_nats_o(
         chunk_size: int = 64,
         nats_block_size: int = 8,
         offset_op: int = 0,
+        n_tokens_in_init_chunk:int=0,
         compute_incomplete_block_scores: bool = False,
         incomplete_block_start_with_ht: bool = True,
         decay_for_non_gdn_blocks:bool=False,
@@ -1248,6 +1250,7 @@ def chunk_fwd_nats_o(
         NAtS_BLOCK_SIZE=nats_block_size,
         N_TYPES=n_opts,
         OFFSET_OP=offset_op,
+        N_TOKENS_IN_INIT_CHUNK=n_tokens_in_init_chunk,
         WV_ARE_FLATTENED=not keep_wu_as_kv,
         COMPUTE_INCOMPLETE_BLOCK_SCORES=compute_incomplete_block_scores,
         DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,

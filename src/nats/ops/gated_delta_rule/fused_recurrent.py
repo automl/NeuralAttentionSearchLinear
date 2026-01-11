@@ -20,15 +20,17 @@ def exp(x):
     'USE_GK': lambda args: args['gk'] is not None,
     'USE_GV': lambda args: args['gv'] is not None,
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'HAS_G_CUMSUM': lambda args: args['g_cumsum'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.jit(do_not_specialize=['T', 'TNAtS'])
+@triton.jit(do_not_specialize=['T', 'TNAtS', 'STRIDE_KB', 'STRIDE_VB'])
 def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     q,
     k,
     v,
     g,
+    g_cumsum,
     gk,
     gv,
     beta,
@@ -55,6 +57,8 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     NATS_BLOCK_SIZE: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    STRIDE_KB,
+    STRIDE_VB,
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_GV: tl.constexpr,
@@ -62,6 +66,11 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     IS_BETA_HEADWISE: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
+    ONLY_UPDATE_H: tl.constexpr,
+    ONLY_WITH_CURRENT_CHUNK: tl.constexpr,
+    UPDATE_HS_FOR_EACH_ITER: tl.constexpr,
+    DECAY_FOR_NON_GDN_BLOCKS: tl.constexpr,
+    HAS_G_CUMSUM: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -71,6 +80,9 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
     i_hnats = i_h // GNAtS
     i_gnats = i_h % GNAtS
 
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
@@ -78,18 +90,17 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         bos_nats, eos_nats = tl.load(cu_seqlens_nats + i_b).to(tl.int32), tl.load(cu_seqlens_nats + i_b + 1).to(
             tl.int32)
         TNAtS = eos_nats - bos_nats
+        p_k = k + (bos * H + i_h) * K + o_k
+        p_v = v + (bos * HV + i_hv) * V + o_v
     else:
         bos, eos = i_n * T, i_n * T + T
 
         bos_nats, eos_nats = i_n * TNAtS, i_n * TNAtS + TNAtS
 
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
+        p_k = k + i_n * STRIDE_KB + i_h * K + o_k
+        p_v = v + i_n * STRIDE_VB + i_h * V + o_v
 
     p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-
     if USE_G:
         p_g = g + bos * HV + i_hv
     if USE_GK:
@@ -100,6 +111,12 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         p_beta = beta + bos * HV + i_hv
     else:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
+    if DECAY_FOR_NON_GDN_BLOCKS:
+        if HAS_G_CUMSUM:
+            p_g_cumsum = g_cumsum + i_n * HV + i_hv
+            b_g_cumsum = tl.load(p_g_cumsum)
+        else:
+            b_g_cumsum = 0.
 
     p_o = o + (bos * HV + i_hv) * V + o_v
 
@@ -122,131 +139,30 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
 
     n_iter1 = min(T, NATS_BLOCK_SIZE - b_ntokens_in_current_block)
 
-
     # the first iteration
     for _ in range(0, n_iter1):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        if UPDATE_HS_FOR_EACH_ITER:
+            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-
-        # [BK, BV]
-        if USE_G:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
-
-        if USE_GK:
-            b_gk = tl.load(p_gk).to(tl.float32)
-            b_h *= exp(b_gk[:, None])
-
-        if USE_GV:
-            b_gv = tl.load(p_gv).to(tl.float32)
-            b_h *= exp(b_gv[None, :])
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
-
-        # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        p_q += H*K
-        p_k += H*K
-        p_v += HV*V
-        if USE_G:
-            p_g += HV
-        if USE_GK:
-            p_gk += HV*K
-        if USE_GV:
-            p_gv += HV*V
-        p_beta += HV * (1 if IS_BETA_HEADWISE else V)
-        p_o += HV*V
-
-    # TODO we need to check how to optimize this?
-    # we arrive the end of the first block
-    if n_iter1 == NATS_BLOCK_SIZE - b_ntokens_in_current_block:
-        is_delta = tl.load(nats_block_types)
-        b_h = tl.where(is_delta, b_h, b_hcur)
-        b_hcur = b_h
-    # Now we want to continue the following
-    for _ in range(0, TNAtS - 2):
-        for _ in range(0, NATS_BLOCK_SIZE):
-            b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-            if USE_QK_L2NORM_IN_KERNEL:
-                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            if UPDATE_HS_FOR_EACH_ITER:
                 b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-            b_q = b_q * scale
+        b_q = b_q * scale
+        if UPDATE_HS_FOR_EACH_ITER:
             if IS_BETA_HEADWISE:
                 b_beta = tl.load(p_beta).to(tl.float32)
             else:
                 b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
 
-            # [BK, BV]
-            if USE_G:
-                b_g = tl.load(p_g).to(tl.float32)
-                b_h *= exp(b_g)
-
-            if USE_GK:
-                b_gk = tl.load(p_gk).to(tl.float32)
-                b_h *= exp(b_gk[:, None])
-
-            if USE_GV:
-                b_gv = tl.load(p_gv).to(tl.float32)
-                b_h *= exp(b_gv[None, :])
-
-            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-            b_h += b_k[:, None] * b_v
-
-            # [BV]
-            b_o = tl.sum(b_h * b_q[:, None], 0)
-            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-            p_q += H * K
-            p_k += H * K
-            p_v += HV * V
-            if USE_G:
-                p_g += HV
-            if USE_GK:
-                p_gk += HV * K
-            if USE_GV:
-                p_gv += HV * V
-            p_beta += HV * (1 if IS_BETA_HEADWISE else V)
-            p_o += HV * V
-        nats_block_types += N_TYPES * HNAtS
-        is_delta = tl.load(nats_block_types)
-        b_h = tl.where(is_delta, b_h, b_hcur)
-        b_hcur = b_h
-
-    # the last block
-    n_iters_last = T - n_iter1 - max(TNAtS - 2, 0) * NATS_BLOCK_SIZE
-
-    for _ in range(0, n_iters_last):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-
         # [BK, BV]
         if USE_G:
             b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
+            if DECAY_FOR_NON_GDN_BLOCKS:
+                b_g_cumsum += b_g
 
         if USE_GK:
             b_gk = tl.load(p_gk).to(tl.float32)
@@ -255,12 +171,13 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         if USE_GV:
             b_gv = tl.load(p_gv).to(tl.float32)
             b_h *= exp(b_gv[None, :])
-
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
+        if UPDATE_HS_FOR_EACH_ITER:
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
 
         # [BV]
         b_o = tl.sum(b_h * b_q[:, None], 0)
+
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H*K
@@ -274,17 +191,142 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
             p_gv += HV*V
         p_beta += HV * (1 if IS_BETA_HEADWISE else V)
         p_o += HV*V
+    if not ONLY_UPDATE_H:
+        if not ONLY_WITH_CURRENT_CHUNK:
 
-    # we only store the temporal hidden state if we arrive the new hidden state and the new block is a delta block
-    nats_block_types += N_TYPES * HNAtS
-    is_delta = tl.load(nats_block_types)
+            # TODO we need to check how to optimize this?
+            # we arrive the end of the first block
 
-    if n_iters_last == NATS_BLOCK_SIZE:
-        b_h = tl.where(is_delta, b_h, b_hcur)
-        b_hcur = b_h
+            if n_iter1 == NATS_BLOCK_SIZE - b_ntokens_in_current_block:
+                is_delta = tl.load(nats_block_types)
+                if DECAY_FOR_NON_GDN_BLOCKS:
+                    b_h = tl.where(is_delta, b_h, b_hcur * tl.exp(b_g_cumsum))
+                else:
+                    b_h = tl.where(is_delta, b_h, b_hcur)
 
-    # we need to store b_hcur anyway
-    tl.store(p_hcur, b_hcur.to(p_hcur.dtype.element_ty), mask=mask_h)
+                b_hcur = b_h
+            # Now we want to continue the following
+            for _ in range(0, TNAtS - 2):
+                for _ in range(0, NATS_BLOCK_SIZE):
+                    b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+                    b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+                    b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+                    if USE_QK_L2NORM_IN_KERNEL:
+                        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+                    b_q = b_q * scale
+                    if IS_BETA_HEADWISE:
+                        b_beta = tl.load(p_beta).to(tl.float32)
+                    else:
+                        b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+
+                    # [BK, BV]
+                    if USE_G:
+                        b_g = tl.load(p_g).to(tl.float32)
+                        b_h *= exp(b_g)
+
+                    if USE_GK:
+                        b_gk = tl.load(p_gk).to(tl.float32)
+                        b_h *= exp(b_gk[:, None])
+
+                    if USE_GV:
+                        b_gv = tl.load(p_gv).to(tl.float32)
+                        b_h *= exp(b_gv[None, :])
+
+                    b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+                    b_h += b_k[:, None] * b_v
+
+                    # [BV]
+                    b_o = tl.sum(b_h * b_q[:, None], 0)
+                    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+                    p_q += H * K
+                    p_k += H * K
+                    p_v += HV * V
+                    if USE_G:
+                        p_g += HV
+                    if USE_GK:
+                        p_gk += HV * K
+                    if USE_GV:
+                        p_gv += HV * V
+                    p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+                    p_o += HV * V
+                nats_block_types += N_TYPES * HNAtS
+                is_delta = tl.load(nats_block_types)
+                if DECAY_FOR_NON_GDN_BLOCKS:
+                    b_h = tl.where(is_delta, b_h, b_hcur * tl.exp(b_g_cumsum))
+                else:
+                    b_h = tl.where(is_delta, b_h, b_hcur)
+                b_hcur = b_h
+
+            # the last block
+            n_iters_last = T - n_iter1 - max(TNAtS - 2, 0) * NATS_BLOCK_SIZE
+
+            for _ in range(0, n_iters_last):
+                b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+                b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+                b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+                if USE_QK_L2NORM_IN_KERNEL:
+                    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+                b_q = b_q * scale
+                if IS_BETA_HEADWISE:
+                    b_beta = tl.load(p_beta).to(tl.float32)
+                else:
+                    b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+
+                # [BK, BV]
+                if USE_G:
+                    b_g = tl.load(p_g).to(tl.float32)
+                    b_h *= exp(b_g)
+
+                if USE_GK:
+                    b_gk = tl.load(p_gk).to(tl.float32)
+                    b_h *= exp(b_gk[:, None])
+
+                if USE_GV:
+                    b_gv = tl.load(p_gv).to(tl.float32)
+                    b_h *= exp(b_gv[None, :])
+
+                b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+                b_h += b_k[:, None] * b_v
+
+                # [BV]
+                b_o = tl.sum(b_h * b_q[:, None], 0)
+                tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+                p_q += H*K
+                p_k += H*K
+                p_v += HV*V
+                if USE_G:
+                    p_g += HV
+                if USE_GK:
+                    p_gk += HV*K
+                if USE_GV:
+                    p_gv += HV*V
+                p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+                p_o += HV*V
+
+            # we only store the temporal hidden state if we arrive the new hidden state and the new block is a delta block
+            nats_block_types += N_TYPES * HNAtS
+            is_delta = tl.load(nats_block_types)
+
+            if n_iters_last == NATS_BLOCK_SIZE:
+                if DECAY_FOR_NON_GDN_BLOCKS:
+                    b_h = tl.where(is_delta, b_h, b_hcur * tl.exp(b_g_cumsum))
+                else:
+                    b_h = tl.where(is_delta, b_h, b_hcur)
+                b_hcur = b_h
+        else:
+            is_delta = tl.load(nats_block_types)
+            if DECAY_FOR_NON_GDN_BLOCKS:
+                b_h = tl.where(is_delta, b_h, b_hcur * tl.exp(b_g_cumsum))
+            else:
+                b_h = tl.where(is_delta, b_h, b_hcur)
+            b_hcur = b_h
+
+        # we need to store b_hcur anyway
+        tl.store(p_hcur, b_hcur.to(p_hcur.dtype.element_ty), mask=mask_h)
 
     if STORE_FINAL_STATE:
         p_ht = ht + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
@@ -296,6 +338,7 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     g: Optional[torch.Tensor] = None,
+    g_cumsum: Optional[torch.Tensor]=None,
     gk: Optional[torch.Tensor] = None,
     gv: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
@@ -308,10 +351,12 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     initial_state_in_current_block: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    update_hs_for_each_iter: bool = False,
+    decay_for_non_gdn_blocks: bool= False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_nats: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, H, K, V = *q.shape, v.shape[-1]
     B, TNAtS, HNAtS, N_TYPES = nats_block_types.shape
     HV = v.shape[2]
     GNAtS = H // HNAtS
@@ -322,6 +367,7 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     num_warps = 1
 
     o = torch.empty_like(v)
+    o = torch.empty(B, T, H, V, device=q.device, dtype=q.dtype)
     final_state = q.new_empty(N, HV, K, V, dtype=torch.float32) if output_final_state else None
     if initial_state_in_current_block is None:
         if initial_state is not None:
@@ -330,17 +376,28 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
             initial_state_in_current_block = q.new_zeros(N, HV, K, V, dtype=torch.float32)
 
     if isinstance(n_tokens_in_current_block, int):
+        only_update_h = n_tokens_in_current_block + T < nats_block_size
         n_tokens_in_current_block = torch.full(
             [N], fill_value=n_tokens_in_current_block, device=v.device, dtype=torch.int32
         )
+    else:
+        n_new_tokens = torch.max(n_tokens_in_current_block) + T
+        only_update_h = n_new_tokens < nats_block_size
+    only_with_current_chunk = TNAtS == 1
+    if update_hs_for_each_iter:
+        assert only_with_current_chunk, "if we do not update hs for each iteration, we can only compute output wihtin " \
+                                        "the current iteration"
+
     assert len(n_tokens_in_current_block) == B
 
     grid = (NV, N * HV)
+
     fused_recurrent_gated_delta_rule_fwd_nats_kernel[grid](
         q=q,
         k=k,
         v=v,
         g=g,
+        g_cumsum=g_cumsum,
         gk=gk,
         gv=gv,
         beta=beta,
@@ -364,11 +421,17 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        STRIDE_KB=k.stride(0),
+        STRIDE_VB=v.stride(0),
         N_TYPES=N_TYPES,
         NATS_BLOCK_SIZE=nats_block_size,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         OFFSET_OP=offset_op,
+        ONLY_UPDATE_H=only_update_h,
+        ONLY_WITH_CURRENT_CHUNK=only_with_current_chunk,
+        UPDATE_HS_FOR_EACH_ITER=update_hs_for_each_iter,
+        DECAY_FOR_NON_GDN_BLOCKS=decay_for_non_gdn_blocks,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -385,6 +448,7 @@ class FusedRecurrentNAtSFunction(torch.autograd.Function):
         k: torch.Tensor,
         v: torch.Tensor,
         g: Optional[torch.Tensor] = None,
+        g_cumsum: Optional[torch.Tensor] = None,
         gk: Optional[torch.Tensor] = None,
         gv: Optional[torch.Tensor] = None,
         beta: Optional[torch.Tensor] = None,
@@ -397,14 +461,17 @@ class FusedRecurrentNAtSFunction(torch.autograd.Function):
         initial_state_in_current_block: torch.Tensor = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        update_hs_for_each_iter: bool= True,
+        decay_for_non_gdn_blocks: bool= False,
         cu_seqlens: Optional[torch.LongTensor] = None,
         cu_seqlens_nats: Optional[torch.LongTensor] = None,
     ):
-        o, final_state = fused_recurrent_gated_delta_rule_nats_fwd(
+        o, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule_nats_fwd(
             q=q,
             k=k,
             v=v,
             g=g,
+            g_cumsum=g_cumsum,
             gk=gk,
             gv=gv,
             beta=beta,
@@ -417,6 +484,8 @@ class FusedRecurrentNAtSFunction(torch.autograd.Function):
             offset_op=offset_op,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            update_hs_for_each_iter=update_hs_for_each_iter,
+            decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
         )
@@ -438,18 +507,21 @@ def fused_recurrent_gated_delta_rule(
     k: torch.Tensor,
     v: torch.Tensor,
     g: Optional[torch.Tensor] = None,
+    g_cumsum: Optional[torch.Tensor] = None,
     gk: Optional[torch.Tensor] = None,
     gv: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
     nats_block_types: Optional[torch.Tensor] = None,
-    n_tokens_in_current_block: Optional[torch.Tensor] = 0,
+    n_tokens_in_current_block: torch.Tensor | int = 0,
     nats_block_size:int = 64,
     scale: float = None,
-    offset_op: Optional[torch.Tensor] = 1,
     initial_state: torch.Tensor = None,
     initial_state_current: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    offset_op: Optional[int] = 1,
+    update_hs_for_each_iter: bool=False,
+    decay_for_non_gdn_blocks: bool=False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_nats:Optional[torch.LongTensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -541,6 +613,7 @@ def fused_recurrent_gated_delta_rule(
         k,
         v,
         g,
+        g_cumsum,
         gk,
         gv,
         beta,
@@ -553,6 +626,8 @@ def fused_recurrent_gated_delta_rule(
         initial_state_current,
         output_final_state,
         use_qk_l2norm_in_kernel,
+        update_hs_for_each_iter,
+        decay_for_non_gdn_blocks,
         cu_seqlens,
         cu_seqlens_nats,
     )
