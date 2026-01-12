@@ -31,7 +31,7 @@ else:
     CacheLayerMixin = object
 
 
-class NAtSLayerCache(CacheLayerMixin):
+class NAtSLayerCache:
     is_compileable = True
 
     def __init__(self,
@@ -72,6 +72,33 @@ class NAtSLayerCache(CacheLayerMixin):
         self.n_groups_nats = None
         self.valid_attn_tokens = None
         self.op_for_incomplete_chunk = op_for_incomplete_chunk
+        self.g_cumsum = None
+        # TODO check if we actually need n_nats_blocks or something else!!!
+        self.n_observed_tokens = 0
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+        self.seen_tokens = 0
+
+        self.attn_k: Optional[torch.Tensor] = None
+        self.attn_v: Optional[torch.Tensor] = None
+        self.l_attn_k: Optional[torch.Tensor] = None
+        self.l_attn_v: Optional[torch.Tensor] = None
+        self.recurrent_state: Optional[torch.Tensor] = None
+        self.recurrent_state_block_start: Optional[torch.Tensor] = None
+        self.block_type_state: Optional[torch.Tensor] = None
+        self.conv_state = None
+        self.ffn_state = None
+        # TODO the current implementation only involves the cases where all the sequence in the batch starts with the
+        # same opearionts
+        self._n_tokens_in_nats_block = 0
+        self.block_type_state_logits = None
+
+        self.n_attn_blocks = None  # we note that here only the complete blocks are considered!!!
+        self.n_attn_blocks_max = 0
+        self.n_attn_tokens_max = 0
+
+        self.n_groups_nats = None
+        self.valid_attn_tokens = None
         self.g_cumsum = None
         # TODO check if we actually need n_nats_blocks or something else!!!
         self.n_observed_tokens = 0
@@ -360,8 +387,23 @@ class NAtSCache(transformers.cache_utils.Cache):
     def __init__(
             self,
             seen_tokens: int = 0,
-    ) -> 'NAtSCache':
-        super().__init__()
+            **kwargs) -> 'NAtSCache':
+        parent_init = super().__init__
+        sig = inspect.signature(parent_init)
+        param_names = list(sig.parameters.keys())
+
+        if 'layer_class_to_replicate' in param_names:
+            self.use_layer_class_to_replicate = True
+            super().__init__(layer_class_to_replicate=NAtSLayerCache, **kwargs)
+        elif 'layer_classes' in param_names:
+            self.use_layer_class_to_replicate = False
+            super().__init__(layer_classes=NAtSLayerCache, **kwargs)
+        else:
+            raise TypeError(
+                "NAtSLayer cache initialization failed: HFCacheBase.__init__ accepts neither "
+                "'layer_class_to_replicate' nor 'layer_classes'. This might be caused by an incompatible "
+                "transformers version. Please check your transformers>=4.36.0"
+            )
 
         self.states: List[NAtSLayerCache | Dict[str, Any]] = []
 

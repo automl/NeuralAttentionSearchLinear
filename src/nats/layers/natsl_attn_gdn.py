@@ -278,7 +278,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
 
         self.outputs_are_wighted = outputs_are_wighted
         if self.outputs_are_wighted:
-            self.nats_out_weights_layer = nn.Linear(hidden_size, self.n_ops * self.num_nats_head, bias=False)
+            self.nats_out_weights_layer = nn.Linear(self.key_dim, self.n_ops * self.num_attn_heads, bias=False)
 
         if use_short_conv:
             self.conv_size = conv_size
@@ -307,11 +307,11 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             )
         if use_gate:
             self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-            self.o_norm = FusedMultiInputRMSNormGated(self.head_v_dim, eps=norm_eps)
+            self.o_norm = FusedMultiInputRMSNormGated(self.head_attn_v_dim , eps=norm_eps)
         else:
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
-        self.attn_fraction = 0
+        self.attn_fraction = torch.zeros(1)
 
     def forward(
             self,
@@ -375,7 +375,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if self.attn_with_short_conv:
-                if nats_cache is not None:
+                if nats_cache is not None and nats_cache.conv_state is not None:
                     conv_state_q, conv_state_k, conv_state_v = nats_cache.conv_state
                 q, conv_state_q = self.q_conv1d(
                     x=self.q_proj(hidden_states),
@@ -439,6 +439,8 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 q = F.silu(q_attn)
                 k = F.silu(k_attn)
                 v = F.silu(v_attn)
+        if self.outputs_are_wighted:
+            o_weights = self.nats_out_weights_layer(q).unflatten(-1, (self.num_attn_heads, self.n_ops)).softmax(-1)
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
@@ -585,9 +587,9 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         if self.use_gate:
             g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
             if self.outputs_are_wighted:
-                o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
+                #o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
                 #o = self.o_norm(o_gated_delta * (o_weights[..., [1]] ), o_attn.view(o_gated_delta.shape) * o_weights[..., [0]], g)
-                o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape), g, o_weights)
+                o = self.o_norm(o_gated_delta.view(o_attn.shape), o_attn, g, o_weights)
             else:
                 o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape),g)
         else:
