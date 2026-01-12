@@ -136,9 +136,47 @@ class NAtSLayerCache:
                 msk, self.nats_block_size, 1
             )[:, :self.n_attn_tokens_max + 1].transpose(1,2).unsqueeze(-2).bool()
         else:
-            # TODO masks for incomplete chunnks
-            raise NotImplementedError
+            if nats_block_types.shape[1] == 1:
+                # in this case, we do normal causal mask
+                if compute_incomplete_chunk:
+                    msk = torch.ones(n_data, n_data + self._n_tokens_in_nats_block, device=nats_block_types.device,
+                                     dtype=nats_block_types.dtype)
+                    msk = msk.tril_(self._n_tokens_in_nats_block)
+                else:
+                    # TODO how to sol;ve this?
+                    msk = torch.zeros(n_data, n_data + self._n_tokens_in_nats_block, device=nats_block_types.device,
+                                     dtype=nats_block_types.dtype)
+                msk = msk.view(1,1, n_data, n_data + self._n_tokens_in_nats_block).bool()
+            else:
+                valid_columns = torch.transpose(nats_block_types[..., self.attn_offset], 1, 2)
+                mask_current = valid_columns.unsqueeze(-2)
+                n_datar_cur = self._n_tokens_in_nats_block + n_data
 
+                if compute_incomplete_chunk:
+                    mask_diag = torch.ones(self.nats_block_size, self.nats_block_size,
+                                           dtype=nats_block_types.dtype, device=mask_current.device).tril_(0)
+                    n_datar_cur = self._n_tokens_in_nats_block + n_data
+                    mask_diag = torch.block_diag(*[mask_diag for _ in range(nats_block_types.shape[1])])[self._n_tokens_in_nats_block:n_datar_cur, :n_datar_cur]
+                    mask_current = mask_current.repeat_interleave(self.nats_block_size, 3)[..., :n_datar_cur]
+                    mask_current = mask_diag[None, None, :, :] + mask_current
+                    mask_current = mask_current.tril_(self._n_tokens_in_nats_block)
+                else:
+                    n_new_chunks = nats_block_types.shape[1]
+                    full_chunks = torch.ones(n_new_chunks,n_new_chunks,
+                                             device=mask_current.device,
+                                             dtype=mask_current.dtype).tril(-1)
+                    full_chunks = full_chunks.repeat_interleave(
+                        self.nats_block_size, 0).repeat_interleave(self.nats_block_size, 1)
+                    mask_current = (valid_columns.unsqueeze(-2) * full_chunks[None, None, :, :])[self._n_tokens_in_nats_block:n_datar_cur, :n_datar_cur]
+
+                if self.n_attn_blocks_max > 0:
+                    mask_past = self.valid_attn_tokens[:, :self.n_attn_blocks_max]
+                    mask_past = torch.repeat_interleave(
+                        mask_past, self.nats_block_size, 1
+                    ).transpose(1, 2).unsqueeze(-2)
+                    msk = torch.cat([mask_past, mask_current], dim=-1).bool()
+                else:
+                    msk = mask_current
         return msk
 
     def update_attn_cache(self,
@@ -362,6 +400,13 @@ class NAtSLayerCache:
                     n_heads_nats = nats_block_types.shape[2]
 
                     self.n_attn_blocks = torch.zeros([k_state.shape[0], n_heads_nats], device=k_state.device, dtype=torch.int64)
+                n_attn_blocks_max = self.n_attn_blocks.max()
+                if has_incomplete_blocks:
+                    self.valid_attn_tokens[:, n_attn_blocks_max, ] = 1
+                    self.valid_attn_tokens[:, n_attn_blocks_max + 1:, ] = 0
+                else:
+                    self.valid_attn_tokens[:, n_attn_blocks_max:, ] = 0
+
 
             self._n_tokens_in_nats_block = (self._n_tokens_in_nats_block + n_new_tokens) % self.nats_block_size
             self.n_attn_tokens_max = self.n_attn_blocks_max * self.nats_block_size + self._n_tokens_in_nats_block

@@ -544,30 +544,28 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             )
         elif mode == 'fused_recurrent':
             # we first start with the attn output
-            if q_len == 1:
-                attn_msk = nats_cache.generate_msk(n_data= q_len)
-                # recurrent_state_gated_delta_ = recurrent_state_gated_delta.clone()
-                o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_recurrent(
-                    q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
-                    q_lattn=q, k_lattn=k, v_lattn=v,
-                    attn_msk=attn_msk,
-                    initial_state_gated_delta=recurrent_state_gated_delta,
-                    initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
-                    g=g, g_cumsum=g_cumsum, beta=beta,
-                    nats_block_types=nats_op_types,
-                    n_tokens_in_current_block=nats_cache._n_tokens_in_nats_block if nats_cache is not None else 0,
-                    scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
-                    cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
-                    nats_block_size=self.nats_block_size,
-                    ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
-                    output_final_state_gated_delta=use_cache,
-                    incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
-                    decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
-                    use_g_for_attn=self.usg_for_attn,
-                    lattn_use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                raise NotImplementedError
+            attn_msk = nats_cache.generate_msk(n_data= q_len, nats_block_types=nats_op_types,
+                                               compute_incomplete_chunk=self.ops_for_incomplete_chunks != 'gated_delta_net')
+            # recurrent_state_gated_delta_ = recurrent_state_gated_delta.clone()
+            o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_recurrent(
+                q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                q_lattn=q, k_lattn=k, v_lattn=v,
+                attn_msk=attn_msk,
+                initial_state_gated_delta=recurrent_state_gated_delta,
+                initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
+                g=g, g_cumsum=g_cumsum, beta=beta,
+                nats_block_types=nats_op_types,
+                n_tokens_in_current_block=nats_cache._n_tokens_in_nats_block if nats_cache is not None else 0,
+                scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
+                nats_block_size=self.nats_block_size,
+                ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
+                output_final_state_gated_delta=use_cache,
+                incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
+                use_g_for_attn=self.usg_for_attn,
+                lattn_use_qk_l2norm_in_kernel=True,
+            )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
@@ -623,7 +621,7 @@ def test_mixed_attn():
                                                decay_for_non_gdn_blocks=True,
                                         ).cuda().to(dtype=dtype)
     layer = layer.eval()
-    nt = 4094
+    nt = 118
     #nt = 534
     input_data = torch.randn((2, nt, 1024)).cuda().to(dtype=dtype)
     out1 = layer(input_data)[0]
@@ -631,7 +629,7 @@ def test_mixed_attn():
     cache = [NAtSLayerCache(op_for_incomplete_chunk=ops_for_incomplete_chunks)]
     out2 = torch.empty_like(out1).to(dtype=dtype)
     #nt2 = 256
-    nt2=85
+    nt2=65
     nt1 = nt-nt2
 
     out21, _, cache = layer(input_data[:, :nt1], past_key_values=cache, use_cache=True)
