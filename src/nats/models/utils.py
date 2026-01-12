@@ -11,8 +11,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fla.models.utils import Cache
 
+import inspect
+from typing import Any, Dict, List, Optional, Union
 
-class NAtSLayerCache:
+import torch
+import transformers
+from packaging import version
+from transformers.cache_utils import Cache as HFCacheBase
+from transformers.generation import GenerationMixin
+from transformers.utils.deprecation import deprecate_kwarg
+
+_TF_VERSION = transformers.__version__
+_NEED_NEW = "4.53.3"
+_IS_TRANSFORMERS_4_56_PLUS = version.parse(_TF_VERSION) >= version.parse("4.56.0")
+
+if version.parse(_TF_VERSION) > version.parse(_NEED_NEW):
+    from transformers.cache_utils import CacheLayerMixin
+else:
+    CacheLayerMixin = object
+
+
+class NAtSLayerCache(CacheLayerMixin):
     is_compileable = True
 
     def __init__(self,
@@ -25,7 +44,7 @@ class NAtSLayerCache:
                  n_ops: int = 2,
                  op_for_incomplete_chunk: str = 'attn'
                  ) -> 'NAtSLayerCache':
-        # TODO: The current
+        super().__init__()
         self.seen_tokens = seen_tokens
 
         self.attn_k: Optional[torch.Tensor] = None
@@ -208,19 +227,6 @@ class NAtSLayerCache:
             n_heads_nats = nats_block_types.shape[2]
             self.n_groups_nats = nhead_attn // n_heads_nats
 
-        if self.op_for_incomplete_chunk not in ['all', 'gated_delta_net']:
-            lattn_k, lattn_v = l_attn_state
-            # in this case, we do not update the hidden states for gdn at every step, but only do that
-            if self.l_attn_k is not None:
-                self.l_attn_k = torch.zeros(
-                    lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2], lattn_k.shape[3],
-                    device=lattn_k.device, dtype=lattn_k.dtype
-                )
-                self.l_attn_v = torch.zeros(
-                    lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2], lattn_k.shape[3],
-                    device=lattn_k.device, dtype=lattn_k.dtype
-                )
-
         if n_new_tokens + self._n_tokens_in_nats_block >= self.nats_block_size:
             # In this case, we need to update new information and remove the unnecessary attention caches
             self.recurrent_state = recurrent_state
@@ -354,18 +360,14 @@ class NAtSCache(transformers.cache_utils.Cache):
     def __init__(
             self,
             seen_tokens: int = 0,
-            n_tokens_in_nats_block: int = 0,
-            nats_block_size: int = 64,
     ) -> 'NAtSCache':
         super().__init__()
 
-        self.states: List[Dict[str, Any]] = []
+        self.states: List[NAtSLayerCache | Dict[str, Any]] = []
 
         self._seen_tokens = seen_tokens  # Used in `generate` to keep tally of how many tokens the cache has seen
-        self._n_tokens_in_nats_block = n_tokens_in_nats_block
-        self.nats_block_size = nats_block_size
 
-    def __getitem__(self, layer_idx: int) -> Dict[str, Any]:
+    def __getitem__(self, layer_idx: int) -> NAtSLayerCache | Dict[str, Any]:
         if layer_idx < len(self):
             return self.states[layer_idx]
         else:
@@ -377,6 +379,26 @@ class NAtSCache(transformers.cache_utils.Cache):
 
     def __len__(self):
         return len(self.states)
+
+    def add_natsl_layer_cache(self,
+                              seen_tokens: int =0,
+                              n_tokens_in_nats_block: int=0,
+                              n_attn_blocks: [torch.Tensor] = None,
+                              nats_block_size: int=64,
+                              attn_offset: int=0,
+                              recurrent_offset: int =1,
+                              n_ops:int=2,
+                              op_for_incomplete_chunk: str= 'all'
+                              ):
+        self.states.append(
+            NAtSLayerCache(seen_tokens,
+                           n_tokens_in_nats_block,
+                           n_attn_blocks,
+                           nats_block_size,
+                           attn_offset,
+                           recurrent_offset,
+                           n_ops,
+                           op_for_incomplete_chunk))
 
     def update(
             self,
@@ -493,6 +515,8 @@ class NAtSCache(transformers.cache_utils.Cache):
             for layer_idx in range(len(past_key_values)):
                 cache.states.append(past_key_values[layer_idx])
         return cache
+
+
 
 
 def test_nats_cache_attn():

@@ -25,7 +25,7 @@ from nats.ops.mixed_ops.mixed_attn_gdn import (
     nats_mixed_attn_gdn
 )
 from nats.modules.fused_norm_gate import FusedMultiInputRMSNormGated
-from nats.models.utils import NAtSLayerCache
+from nats.models.utils import NAtSLayerCache, NAtSCache
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -317,11 +317,11 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             self,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[Cache] = None,
+            past_key_values: Optional[NAtSCache] = None,
             use_cache: Optional[bool] = False,
             output_attentions: Optional[bool] = False,
             **kwargs: Unpack[Dict]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[NAtSCache]]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -335,6 +335,14 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
         nats_cache: NAtSLayerCache | None = None
+        if past_key_values is not None:
+            if len(past_key_values) > self.layer_idx:
+                nats_cache = past_key_values[self.layer_idx]
+            else:
+                past_key_values.add_natsl_layer_cache(
+                    0, n_tokens_in_nats_block=0, n_attn_blocks=None,
+                    nats_block_size=self.nats_block_size, op_for_incomplete_chunk=self.ops_for_incomplete_chunks,
+                )
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             nats_cache = past_key_values[self.layer_idx]
 
@@ -348,6 +356,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         else:
             nats_layer_input = hidden_states
             self.nats_layer_input = nats_layer_input
+
         if nats_layer_input is not None:
             hs_reduced = self.pooling_func(
                 nats_layer_input.unsqueeze(-2),
