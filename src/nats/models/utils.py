@@ -357,6 +357,12 @@ class NAtSLayerCache:
                                              t2=self.nats_block_size, h2=self.n_groups_nats
                                              )
 
+                if self.n_attn_blocks is None:
+                    k_state = attn_state[0]
+                    n_heads_nats = nats_block_types.shape[2]
+
+                    self.n_attn_blocks = torch.zeros([k_state.shape[0], n_heads_nats], device=k_state.device, dtype=torch.int64)
+
             self._n_tokens_in_nats_block = (self._n_tokens_in_nats_block + n_new_tokens) % self.nats_block_size
             self.n_attn_tokens_max = self.n_attn_blocks_max * self.nats_block_size + self._n_tokens_in_nats_block
             if self._n_tokens_in_nats_block == 0:
