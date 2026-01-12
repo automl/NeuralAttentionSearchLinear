@@ -267,70 +267,96 @@ class NAtSLayerCache:
                 attn_blocks[:, -1] = 0
 
             # We now want to only preserve the KV caches that are mapped as
+
             n_blocks_per_seq = attn_blocks.sum(1).flatten()
             max_block_size = torch.max(n_blocks_per_seq)
-            max_block_size_ranges = torch.arange(max_block_size, device=attn_blocks.device)
-            mask = (max_block_size_ranges.unsqueeze(0) < n_blocks_per_seq.unsqueeze(1))
-            shift_idx = max_block_size_ranges.repeat(len(n_blocks_per_seq))[mask.flatten()]
-            non_zero_idx = torch.nonzero(attn_blocks.transpose(1,
-                                                               2))  # we need to keep the form as [B, H, N] such that the sequenth length dimension can be correctly ordered!
+            if max_block_size > 0:
+                # this only applies if we have
+                max_block_size_ranges = torch.arange(max_block_size, device=attn_blocks.device)
+                mask = (max_block_size_ranges.unsqueeze(0) < n_blocks_per_seq.unsqueeze(1))
+                shift_idx = max_block_size_ranges.repeat(len(n_blocks_per_seq))[mask.flatten()]
+                non_zero_idx = torch.nonzero(attn_blocks.transpose(1,
+                                                                   2))  # we need to keep the form as [B, H, N] such that the sequenth length dimension can be correctly ordered!
 
-            b_idx = non_zero_idx[:, 0]
-            h_idx = non_zero_idx[:, 1]
-            if self.n_attn_blocks is not None:
-                new_blocks_base = self.n_attn_blocks[b_idx, h_idx]
+                b_idx = non_zero_idx[:, 0]
+                h_idx = non_zero_idx[:, 1]
+                if self.n_attn_blocks is not None:
+                    new_blocks_base = self.n_attn_blocks[b_idx, h_idx]
 
-                shift_idx += new_blocks_base
-                new_kv_start_idx_block = self.n_attn_blocks.min()
-                new_kv_end_idx_block = nats_block_types.shape[1] + self.n_attn_blocks_max
-            else:
-                new_kv_start_idx_block = 0
-                new_kv_end_idx_block = nats_block_types.shape[1]
-                # shift_idx = torch.cat(non_zero_idx[:, :2], shift_idx[:, None], dim=-1)
-            if has_incomplete_blocks:
-                incomplete_block_shift_idx = shift_idx.max() + 1
-            update_idx = non_zero_idx[:, 2] + self.n_attn_blocks_max - new_kv_start_idx_block
-
-            for kv_cache in (self.attn_k, self.attn_v):
-                kv_cache = rearrange(kv_cache, 'b (t1 t2) (h1 h2) d -> b t1 t2 h1 h2 d',
-                                     t2=self.nats_block_size, h2=self.n_groups_nats
-                                     )
-                new_data = kv_cache[:, new_kv_start_idx_block: new_kv_end_idx_block]
-
-                fill_value = new_data[b_idx, update_idx, :, h_idx].clone()
-                kv_cache[b_idx, shift_idx, :, h_idx] = fill_value
+                    shift_idx += new_blocks_base
+                    new_kv_start_idx_block = self.n_attn_blocks.min()
+                    new_kv_end_idx_block = nats_block_types.shape[1] + self.n_attn_blocks_max
+                else:
+                    new_kv_start_idx_block = 0
+                    new_kv_end_idx_block = nats_block_types.shape[1]
+                    # shift_idx = torch.cat(non_zero_idx[:, :2], shift_idx[:, None], dim=-1)
                 if has_incomplete_blocks:
-                    fill_value = new_data[:, -1, :].clone()
-                    kv_cache[:, incomplete_block_shift_idx, :] = fill_value
-                kv_cache = rearrange(kv_cache, 'b t1 t2 h1 h2 d -> b (t1 t2) (h1 h2) d',
-                                     t2=self.nats_block_size, h2=self.n_groups_nats
-                                     )
-            n_new_blocks = torch.sum(attn_blocks, 1)
-            n_last_attn_token = shift_idx.max() + 1
+                    incomplete_block_shift_idx = shift_idx.max() + 1
+                update_idx = non_zero_idx[:, 2] + self.n_attn_blocks_max - new_kv_start_idx_block
 
-            if self.n_attn_blocks is None:
-                n_attn_blocks_updated = n_new_blocks - new_kv_start_idx_block
+                for kv_cache in (self.attn_k, self.attn_v):
+                    kv_cache = rearrange(kv_cache, 'b (t1 t2) (h1 h2) d -> b t1 t2 h1 h2 d',
+                                         t2=self.nats_block_size, h2=self.n_groups_nats
+                                         )
+                    new_data = kv_cache[:, new_kv_start_idx_block: new_kv_end_idx_block]
 
+                    fill_value = new_data[b_idx, update_idx, :, h_idx].clone()
+                    kv_cache[b_idx, shift_idx, :, h_idx] = fill_value
+                    if has_incomplete_blocks:
+                        fill_value = new_data[:, -1, :].clone()
+                        kv_cache[:, incomplete_block_shift_idx, :] = fill_value
+                    kv_cache = rearrange(kv_cache, 'b t1 t2 h1 h2 d -> b (t1 t2) (h1 h2) d',
+                                         t2=self.nats_block_size, h2=self.n_groups_nats
+                                         )
+                n_new_blocks = torch.sum(attn_blocks, 1)
+                n_last_attn_token = shift_idx.max() + 1
+
+                if self.n_attn_blocks is None:
+                    n_attn_blocks_updated = n_new_blocks - new_kv_start_idx_block
+
+                else:
+                    n_attn_blocks_updated = n_new_blocks + self.n_attn_blocks - new_kv_start_idx_block
+
+                new_blocks_are_valid = torch.arange(
+                    n_last_attn_token - new_kv_start_idx_block, device=n_new_blocks.device
+                ).view(1, n_last_attn_token - new_kv_start_idx_block, 1) < n_attn_blocks_updated.unsqueeze(1)
+
+                self.valid_attn_tokens[:, new_kv_start_idx_block:n_last_attn_token, ] = new_blocks_are_valid
+
+                if has_incomplete_blocks:
+                    self.valid_attn_tokens[:, n_last_attn_token, ] = 1
+                    self.valid_attn_tokens[:, n_last_attn_token + 1:, ] = 0
+                else:
+                    self.valid_attn_tokens[:, n_last_attn_token:, ] = 0
+
+                if self.n_attn_blocks is None:
+                    self.n_attn_blocks = n_new_blocks
+                else:
+                    self.n_attn_blocks += n_new_blocks
+                self.n_attn_blocks_max = self.n_attn_blocks.max()
             else:
-                n_attn_blocks_updated = n_new_blocks + self.n_attn_blocks - new_kv_start_idx_block
+                if self.n_attn_blocks is not None:
+                    incomplete_block_shift_idx = self.n_attn_blocks.max()
+                    new_kv_start_idx_block = self.n_attn_blocks.min()
+                    incomplete_block_shift_idx_ = incomplete_block_shift_idx - new_kv_start_idx_block
+                    new_kv_end_idx_block = nats_block_types.shape[1] + self.n_attn_blocks_max
+                else:
+                    new_kv_start_idx_block = 0
+                    new_kv_end_idx_block = nats_block_types.shape[1]
+                    incomplete_block_shift_idx = 0
+                    incomplete_block_shift_idx_ = 0
+                if has_incomplete_blocks:
+                    for kv_cache in (self.attn_k, self.attn_v):
+                        kv_cache = rearrange(kv_cache, 'b (t1 t2) (h1 h2) d -> b t1 t2 h1 h2 d',
+                                             t2=self.nats_block_size, h2=self.n_groups_nats
+                                             )
+                        new_data = kv_cache[:, new_kv_start_idx_block: new_kv_end_idx_block]
+                        fill_value = new_data[:, -1, :].clone()
+                        kv_cache[:, incomplete_block_shift_idx_, :] = fill_value
+                        kv_cache = rearrange(kv_cache, 'b t1 t2 h1 h2 d -> b (t1 t2) (h1 h2) d',
+                                             t2=self.nats_block_size, h2=self.n_groups_nats
+                                             )
 
-            new_blocks_are_valid = torch.arange(
-                n_last_attn_token - new_kv_start_idx_block, device=n_new_blocks.device
-            ).view(1, n_last_attn_token - new_kv_start_idx_block, 1) < n_attn_blocks_updated.unsqueeze(1)
-
-            self.valid_attn_tokens[:, new_kv_start_idx_block:n_last_attn_token, ] = new_blocks_are_valid
-
-            if has_incomplete_blocks:
-                self.valid_attn_tokens[:, n_last_attn_token, ] = 1
-                self.valid_attn_tokens[:, n_last_attn_token + 1:, ] = 0
-            else:
-                self.valid_attn_tokens[:, n_last_attn_token:, ] = 0
-
-            if self.n_attn_blocks is None:
-                self.n_attn_blocks = n_new_blocks
-            else:
-                self.n_attn_blocks += n_new_blocks
-            self.n_attn_blocks_max = self.n_attn_blocks .max()
             self._n_tokens_in_nats_block = (self._n_tokens_in_nats_block + n_new_tokens) % self.nats_block_size
             self.n_attn_tokens_max = self.n_attn_blocks_max * self.nats_block_size + self._n_tokens_in_nats_block
             if self._n_tokens_in_nats_block == 0:
