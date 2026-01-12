@@ -18,7 +18,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
-from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
 from fla.modules import GatedMLP as GatedDeltaNetMLP
 from fla.layers.gated_deltanet import GatedDeltaNet
@@ -27,6 +26,7 @@ from fla.modules.l2warp import l2_warp
 
 from nats.models.natsl_attn_gdn.configuration_natsl_attn_gdn import NeuralAttentionSearchLineraAttnGDNConfig
 from nats.layers.natsl_attn_gdn import NeuralAttentionSearchLinearAttnGDN
+from nats.models.utils import NAtSCache as Cache
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
