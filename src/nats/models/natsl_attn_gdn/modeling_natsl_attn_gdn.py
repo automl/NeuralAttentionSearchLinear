@@ -12,6 +12,9 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 
+import transformers
+from packaging import version
+
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -27,6 +30,10 @@ from fla.modules.l2warp import l2_warp
 from nats.models.natsl_attn_gdn.configuration_natsl_attn_gdn import NeuralAttentionSearchLineraAttnGDNConfig
 from nats.layers.natsl_attn_gdn import NeuralAttentionSearchLinearAttnGDN
 from nats.models.utils import NAtSCache as Cache
+
+_TF_VERSION = transformers.__version__
+_NEED_NEW = "4.53.3"
+_IS_TRANSFORMERS_4_56_PLUS = version.parse(_TF_VERSION) >= version.parse("4.56.0")
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -365,25 +372,61 @@ class NeuralAttentionSearchLinearAttnGDNForCausalLM(NeuralAttentionSearchLinearA
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         use_cache: bool = True,
         logits_to_keep: Optional[int] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs
     ):
-        # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if past_key_values is not None and len(past_key_values) > 0:
-            input_ids = input_ids[:, -1:]
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and len(past_key_values) == 0:
-            model_inputs = {'inputs_embeds': inputs_embeds}
+        # Use pre-computed version comparison for performance
+        if _IS_TRANSFORMERS_4_56_PLUS:
+            # For transformers 4.56.0+, use cache_position-based logic
+            model_inputs = {}
+
+            # Handle cache-dependent input preparation
+            if past_key_values is not None:
+                model_inputs["past_key_values"] = past_key_values
+
+                # Use the new cache-dependent input preparation method if available
+                if hasattr(self, '_cache_dependant_input_preparation') and cache_position is not None:
+                    inputs_embeds, input_ids = self._cache_dependant_input_preparation(
+                        input_ids, inputs_embeds, cache_position
+                    )
+                elif cache_position is not None:
+                    # Fallback: manually slice using cache_position
+                    if input_ids is not None and input_ids.shape[1] != cache_position.shape[0]:
+                        input_ids = input_ids[:, cache_position]
+                elif hasattr(past_key_values, '__len__') and len(past_key_values) > 0:
+                    # Ultimate fallback to old behavior
+                    input_ids = input_ids[:, -1:]
+
+            # Handle input format (similar to base class logic)
+            if inputs_embeds is not None and (cache_position is None or len(cache_position) == inputs_embeds.shape[1]):
+                model_inputs['inputs_embeds'] = inputs_embeds
+                model_inputs['input_ids'] = None
+            else:
+                model_inputs['input_ids'] = input_ids.contiguous() if input_ids is not None else None
+                model_inputs['inputs_embeds'] = None
+
+            model_inputs['cache_position'] = cache_position
+
         else:
-            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
-            # recompiles graphs as the stride of the inputs is a guard.
-            # Ref: https://github.com/huggingface/transformers/pull/29114
-            # TODO: use `next_tokens` directly instead.
-            model_inputs = {'input_ids': input_ids.contiguous()}
+            # For older transformers versions, use the original logic
+            model_inputs = {}
+            # only last token for `inputs_ids` if the `past_key_values` is not empty.
+            if past_key_values is not None and hasattr(past_key_values, '__len__') and len(past_key_values) > 0:
+                input_ids = input_ids[:, -1:]
+            # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+            if inputs_embeds is not None and hasattr(past_key_values, '__len__') and len(past_key_values) == 0:
+                model_inputs = {'inputs_embeds': inputs_embeds}
+            else:
+                # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+                # recompiles graphs as the stride of the inputs is a guard.
+                # Ref: https://github.com/huggingface/transformers/pull/29114
+                # TODO: use `next_tokens` directly instead.
+                model_inputs = {'input_ids': input_ids.contiguous()}
 
         if logits_to_keep is not None:
             model_inputs['logits_to_keep'] = logits_to_keep
