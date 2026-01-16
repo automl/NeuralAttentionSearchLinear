@@ -347,9 +347,6 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             nats_cache = past_key_values[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens', None)
-        if attention_mask is not None:
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
         # TODO we need our own fun here...
         if nats_cache is not None:
             nats_layer_input = nats_cache.update_attn_types(input_hidden_states=hidden_states)
@@ -463,10 +460,10 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
                 max_seqlen = q.shape[1] + seqlen_offset
 
-                if attention_mask is not None:
-                    # to deliminate the offsets of padding tokens
-                    seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
-                    max_seqlen = q.shape[1] + max(seqlen_offset)
+                #if attention_mask is not None:
+                #    # to deliminate the offsets of padding tokens
+                #    seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
+                #    max_seqlen = q.shape[1] + max(seqlen_offset)
 
             if self.attn_max_position_embeddings is not None:
                 max_seqlen = max(max_seqlen, self.attn_max_position_embeddings)
@@ -595,8 +592,8 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             #o = self.o_norm(o)
         o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
-        if attention_mask is not None:
-            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
+        #if attention_mask is not None:
+        #    o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
 
