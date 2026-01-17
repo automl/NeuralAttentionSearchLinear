@@ -457,7 +457,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
 
             seqlen_offset, max_seqlen = 0, q_len
             if past_key_values is not None:
-                seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+                seqlen_offset = nats_cache.n_observed_tokens
                 max_seqlen = q.shape[1] + seqlen_offset
 
                 #if attention_mask is not None:
@@ -479,7 +479,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         if nats_cache is not None:
             nats_op_types_raw = nats_op_types.clone()
             k_attn, v_attn = nats_cache.update_attn_cache((k_attn, v_attn), nats_block_types=nats_op_types_raw,)
-            k, v = nats_cache.update_lattn_cache((k,v), mode, self.ops_for_incomplete_chunks)
+            k, v, beta, g = nats_cache.update_lattn_cache((k,v), beta, g, mode, self.ops_for_incomplete_chunks)
             recurrent_state_gdn_block_start = nats_cache.recurrent_state_block_start
             recurrent_state_gated_delta = nats_cache.recurrent_state
             g_cumsum = nats_cache.g_cumsum
@@ -539,11 +539,15 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
+            if nats_cache is not None:
+                self.nats_op_types = nats_op_types
+
         elif mode == 'fused_recurrent':
             # we first start with the attn output
             attn_msk = nats_cache.generate_msk(n_data= q_len, nats_block_types=nats_op_types,
                                                compute_incomplete_chunk=self.ops_for_incomplete_chunks != 'gated_delta_net')
             # recurrent_state_gated_delta_ = recurrent_state_gated_delta.clone()
+
             o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_recurrent(
                 q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
                 q_lattn=q, k_lattn=k, v_lattn=v,
@@ -605,7 +609,7 @@ def test_mixed_attn():
     from torch.nn import functional as F
 
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-    ops_for_incomplete_chunks='all'
+    ops_for_incomplete_chunks='attn'
 
     layer = NeuralAttentionSearchLinearAttnGDN(hidden_size=1024, head_dim=128, num_heads=6, num_attn_heads=12,
                                         expand_v=2,
@@ -618,15 +622,15 @@ def test_mixed_attn():
                                                decay_for_non_gdn_blocks=True,
                                         ).cuda().to(dtype=dtype)
     layer = layer.eval()
-    nt = 118
-    #nt = 534
+    #nt = 118
+    nt = 432
     input_data = torch.randn((2, nt, 1024)).cuda().to(dtype=dtype)
     out1 = layer(input_data)[0]
 
     cache = [NAtSLayerCache(op_for_incomplete_chunk=ops_for_incomplete_chunks)]
     out2 = torch.empty_like(out1).to(dtype=dtype)
     #nt2 = 256
-    nt2=65
+    nt2=48
     nt1 = nt-nt2
 
     out21, _, cache = layer(input_data[:, :nt1], past_key_values=cache, use_cache=True)

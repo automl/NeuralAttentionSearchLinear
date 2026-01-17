@@ -51,6 +51,8 @@ class NAtSLayerCache:
         self.attn_v: Optional[torch.Tensor] = None
         self.l_attn_k: Optional[torch.Tensor] = None
         self.l_attn_v: Optional[torch.Tensor] = None
+        self.g_lattn :Optional[torch.Tensor] = None
+        self.beta_lattn: Optional[torch.Tensor] = None
         self.recurrent_state: Optional[torch.Tensor] = None
         self.recurrent_state_block_start: Optional[torch.Tensor] = None
         self.block_type_state: Optional[torch.Tensor] = None
@@ -221,7 +223,10 @@ class NAtSLayerCache:
 
         return self.attn_k[:, :self.n_attn_tokens_max + new_data_len], self.attn_v[:, :self.n_attn_tokens_max + new_data_len]
 
-    def update_lattn_cache(self, lattn_state: Tuple[torch.Tensor],
+    def update_lattn_cache(self,
+                           lattn_state: Tuple[torch.Tensor],
+                           lattn_beta: torch.Tensor,
+                           lattn_g: Optional[torch.Tensor],
                            mode: str,
                            ops_for_incomplete_chunks: str):
         lattn_k, lattn_v = lattn_state
@@ -235,26 +240,44 @@ class NAtSLayerCache:
                 lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2], lattn_v.shape[3],
                 device=lattn_k.device, dtype=lattn_k.dtype
             )
+            self.lattn_beta = torch.zeros(
+                lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2],
+                device=lattn_k.device, dtype=lattn_beta.dtype
+            )
+            if lattn_g is not None:
+                self.lattn_g = torch.zeros(
+                    lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2],
+                    device=lattn_g.device, dtype=lattn_g.dtype
+                )
             n_tokens_in_lattn_cache = T_lattn % self.nats_block_size
             if n_tokens_in_lattn_cache == 0:
-                return lattn_state
+                return lattn_k, lattn_v, lattn_beta, lattn_g
             if T_lattn > self.nats_block_size:
                 T_remains = T_lattn % self.nats_block_size
                 self.l_attn_k[:, :T_remains] = lattn_k[:, -T_remains:]
                 self.l_attn_v[:, :T_remains] = lattn_v[:, -T_remains:]
-                return lattn_k, lattn_v
+                self.lattn_beta[:,:T_remains] = lattn_beta[:, -T_remains:]
+                if lattn_g is not None:
+                    self.lattn_g[:,:T_remains] = lattn_g[:, -T_remains:]
+                return lattn_k, lattn_v, lattn_beta, lattn_g
             else:
                 self.l_attn_k[:, :T_lattn] = lattn_k
                 self.l_attn_v[:, :T_lattn] = lattn_v
-                return lattn_k, lattn_v
+                self.lattn_beta[:, :T_lattn] = lattn_beta
+                if lattn_g is not None:
+                    self.lattn_g[:, :T_lattn] = lattn_g
+                return lattn_k, lattn_v, lattn_beta, lattn_g
         else:
             T_new = T_lattn + self._n_tokens_in_nats_block
-            if T_new > self.nats_block_size:
+            if T_new >= self.nats_block_size:
                 # we only return the lattn_k and v for the multiple of self.nats_block_size
                 T_remains = T_new % self.nats_block_size
                 self.l_attn_k[:, :T_remains] = lattn_k[:, -T_remains:]
                 self.l_attn_v[:, :T_remains] = lattn_v[:, -T_remains:]
-                if mode == 'chunk' or ops_for_incomplete_chunks != 'attn':
+                self.lattn_beta[:, :T_remains] = lattn_beta[:, -T_remains:]
+                if lattn_g is not None:
+                    self.lattn_g[:, :T_remains] = lattn_g[:, -T_remains:]
+                if mode == 'chunk' or ops_for_incomplete_chunks == 'attn':
                     # THIS is required when we want a chunk form that needs to start from the chunk start #TODO merge this into chunk kernel!
                     lattn_k_new = torch.cat(
                         [self.l_attn_k[:, :self._n_tokens_in_nats_block], lattn_k],
@@ -264,15 +287,30 @@ class NAtSLayerCache:
                         [self.l_attn_v[:, :self._n_tokens_in_nats_block], lattn_v],
                         dim=1
                     )
-                    return lattn_k_new, lattn_v_new
+                    lattn_beta_new = torch.cat(
+                        [self.lattn_beta[:, :self._n_tokens_in_nats_block], lattn_beta],
+                        dim=1
+                    )
+                    if lattn_g is not None:
+                        lattn_g_new = torch.cat(
+                            [self.lattn_g[:, :self._n_tokens_in_nats_block], lattn_g],
+                            dim=1
+                        )
+                    else:
+                        lattn_g_new = None
+                    return lattn_k_new, lattn_v_new, lattn_beta_new, lattn_g_new
                 else:
-                    return lattn_k, lattn_v
+                    return lattn_k, lattn_v, lattn_beta, lattn_g
             else:
                 t_start = self._n_tokens_in_nats_block
                 t_end = T_new
                 self.l_attn_k[:, t_start:t_end] = lattn_k
                 self.l_attn_v[:, t_start:t_end] = lattn_v
-                return lattn_k, lattn_v
+                self.lattn_beta[:, t_start:t_end] = lattn_beta
+                if lattn_g is not None:
+                    self.lattn_g[:, t_start:t_end] = lattn_g
+
+                return lattn_k, lattn_v, lattn_beta, lattn_g
 
     def update(self,
                recurrent_state: Optional[Tuple[torch.Tensor]] = None,
@@ -291,6 +329,9 @@ class NAtSLayerCache:
             nhead_attn = k_state.shape[2]
             n_heads_nats = nats_block_types.shape[2]
             self.n_groups_nats = nhead_attn // n_heads_nats
+
+        if self.op_for_incomplete_chunk == 'attn' and recurrent_state_block_start is not None:
+            recurrent_state = recurrent_state_block_start.clone()
 
         if n_new_tokens + self._n_tokens_in_nats_block >= self.nats_block_size:
             # In this case, we need to update new information and remove the unnecessary attention caches
@@ -410,12 +451,13 @@ class NAtSLayerCache:
 
             self._n_tokens_in_nats_block = (self._n_tokens_in_nats_block + n_new_tokens) % self.nats_block_size
             self.n_attn_tokens_max = self.n_attn_blocks_max * self.nats_block_size + self._n_tokens_in_nats_block
-            if self._n_tokens_in_nats_block == 0:
-                self.g_cumsum = torch.zeros(
-                    g.shape[0], 1, g.shape[2], device=g.device, dtype=g.dtype
-                )
-            else:
-                self.g_cumsum = torch.sum(g[:, -self._n_tokens_in_nats_block:], 1, keepdim=True)
+            if g is not None:
+                if self._n_tokens_in_nats_block == 0:
+                    self.g_cumsum = torch.zeros(
+                        g.shape[0], 1, g.shape[2], device=g.device, dtype=g.dtype
+                    )
+                else:
+                    self.g_cumsum = torch.sum(g[:, -self._n_tokens_in_nats_block:], 1, keepdim=True)
         else:
             self.recurrent_state = recurrent_state
             self.recurrent_state_block_start = recurrent_state_block_start
@@ -430,10 +472,11 @@ class NAtSLayerCache:
 
             self._n_tokens_in_nats_block += n_new_tokens
             self.n_attn_tokens_max += n_new_tokens
-            if self.g_cumsum is None:
-                self.g_cumsum = torch.sum(g, 1, keepdim=True)
-            else:
-                self.g_cumsum += torch.sum(g, 1, keepdim=True)
+            if g is not None:
+                if self.g_cumsum is None:
+                    self.g_cumsum = torch.sum(g, 1, keepdim=True)
+                else:
+                    self.g_cumsum += torch.sum(g, 1, keepdim=True)
 
         if self._n_tokens_in_nats_block == 0:
             self.block_type_state_logits = None
@@ -790,7 +833,8 @@ def test_nats_cache_attn_iter():
     nats_block_type12 = torch.zeros_like(
         nats_block_type12, memory_format=torch.legacy_contiguous_format
     ).scatter_(-1, index, 1.0)
-    k12_o, v12_o = cache1.update_attn_cache((k12, v12))
+    nats_block_type12[:, 29] = 0
+    k12_o, v12_o = cache1.update_attn_cache((k12, v12), nats_block_type12)
 
     cache1.update(attn_state=(k12, v12), nats_block_types=nats_block_type12, n_new_tokens=T12)
     cache_k1 = cache1.attn_k
@@ -809,11 +853,11 @@ def test_nats_cache_attn_iter():
             [nats_block_type21, torch.zeros(B, 1, HNAtS, 2).to(nats_block_type21)], dim=1
         )
     cache2 = NAtSLayerCache()
-    k21_o, v21_o = cache2.update_attn_cache((k21, v21))
+    k21_o, v21_o = cache2.update_attn_cache((k21, v21), nats_block_type21)
     cache2.update(attn_state=(k21, v21), nats_block_types=nats_block_type21, n_new_tokens=T1)
 
     for i in range(T2):
-        k22_o, v2_o = cache2.update_attn_cache((k22[:, [i]], v22[:, [i]]))
+        k22_o, v2_o = cache2.update_attn_cache((k22[:, [i]], v22[:, [i]]), nats_block_type12[:, [(T1 + i) // nats_block_size]])
         cache2.update(attn_state=(k22[:, [i]], v22[:, [i]]),
                       nats_block_types=nats_block_type12[:, [(T1 + i) // nats_block_size]], n_new_tokens=1)
     cache_k2 = cache1.attn_k
@@ -831,7 +875,14 @@ def test_nats_cache_attn_iter():
 
     assert (cache_k1 - cache_k2).abs().sum() == 0
     if valid_attn_tokens1 is not None:
-        assert (valid_attn_tokens1 == valid_attn_tokens2).all()
+        if valid_attn_tokens2.shape[1] >= valid_attn_tokens1.shape[1]:
+            assert (valid_attn_tokens2[:, :valid_attn_tokens1.shape[1]] == valid_attn_tokens1).all()
+            if  valid_attn_tokens2.shape[1] > valid_attn_tokens1.shape[1]:
+                assert valid_attn_tokens2[:, valid_attn_tokens1.shape[1]:].int().sum() == 0
+        else:
+            (valid_attn_tokens2[:, ] == valid_attn_tokens1[:, :valid_attn_tokens2.shape[1]]).all()
+            assert valid_attn_tokens1[:, valid_attn_tokens2.shape[1]:].int().sum() == 0
+
     assert (n_attn_blocks1 == n_attn_blocks2).all()
     import pdb
     pdb.set_trace()
@@ -845,5 +896,5 @@ if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
     # test_compute_h()
     # test_nats_cache_attn()
-    test_nats_cache_attn_chunk_wise()
-    # test_nats_cache_attn_iter()
+    #test_nats_cache_attn_chunk_wise()
+    test_nats_cache_attn_iter()
