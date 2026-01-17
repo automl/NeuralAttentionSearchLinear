@@ -183,8 +183,18 @@ def chunk_gated_delta_rule_nats_inference_fwd(
             n_tokens_in_last_chunk = t_k % nats_block_size
 
             if decay_for_non_gdn_blocks:
-                h_chunk_start = h_chunk_start * torch.exp(
-                    g[:, -n_tokens_in_last_chunk - 1].view(batch_size, num_heads, 1, 1))
+                if n_tokens_in_last_chunk == 0 or nats_block_types.shape[1] <= 1:
+                    h_chunk_start = h_chunk_start * torch.exp(
+                        g[:, -n_tokens_in_last_chunk - 1].view(batch_size, num_heads, 1, 1))
+                else:
+                    # in this case, we need to check if the last complete chunk is a gdn block.If it is,
+                    # then the hidden state is already decayed and we do not need decay this term.
+                    decay = torch.where(
+                        nats_block_types[:,-2,:, offset_delta] > 0,
+                        1.,
+                        torch.exp(g[:, -n_tokens_in_last_chunk - 1])
+                    )
+                    h_chunk_start = h_chunk_start * decay.view(batch_size, num_heads, 1, 1)
 
             if compute_incomplete_chunk_scores:
                 if n_tokens_in_last_chunk == 0:
@@ -192,8 +202,6 @@ def chunk_gated_delta_rule_nats_inference_fwd(
                     h_chunk_start = torch.where((op_type_last_chunk[..., offset_delta]>0).view(batch_size, num_heads, 1, 1),
                                                 final_state,
                                                 h_chunk_start)
-
-
         else:
             final_state = None
             h_chunk_start = None
