@@ -180,14 +180,20 @@ def chunk_gated_delta_rule_nats_inference_fwd(
             batch_size, num_heads = n_nats_blocks.shape[:2]
             h_chunk_start = h[torch.cumsum(n_nats_blocks[..., offset_delta].flatten(), 0) - 1]
             h_chunk_start = h_chunk_start.view(batch_size, num_heads, k.shape[-1], v.shape[-1])
+            n_tokens_in_last_chunk = t_k % nats_block_size
 
-            if t_k % nats_block_size == 0:
-                assert op_type_last_chunk is not None
-                if decay_for_non_gdn_blocks:
-                    h_chunk_start = h_chunk_start * torch.exp(g[:, -1].view(batch_size, num_heads, 1, 1))
-                h_chunk_start = torch.where((op_type_last_chunk[..., offset_delta]>0).view(batch_size, num_heads, 1, 1),
-                                            final_state,
-                                            h_chunk_start)
+            if decay_for_non_gdn_blocks:
+                h_chunk_start = h_chunk_start * torch.exp(
+                    g[:, -n_tokens_in_last_chunk - 1].view(batch_size, num_heads, 1, 1))
+
+            if compute_incomplete_chunk_scores:
+                if n_tokens_in_last_chunk == 0:
+                    assert op_type_last_chunk is not None
+                    h_chunk_start = torch.where((op_type_last_chunk[..., offset_delta]>0).view(batch_size, num_heads, 1, 1),
+                                                final_state,
+                                                h_chunk_start)
+
+
         else:
             final_state = None
             h_chunk_start = None
