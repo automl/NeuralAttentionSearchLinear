@@ -427,8 +427,6 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
     assert len(n_tokens_in_current_block) == B
 
     grid = (NV, N * HV)
-    if only_update_hidden_states:
-        initial_state_in_current_block1 = initial_state_in_current_block.clone()
 
     fused_recurrent_gated_delta_rule_fwd_nats_kernel[grid](
         q=q,
@@ -474,9 +472,6 @@ def fused_recurrent_gated_delta_rule_nats_fwd(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    if only_update_hidden_states:
-        import pdb
-        pdb.set_trace()
 
     return o, final_state, initial_state_in_current_block
 
