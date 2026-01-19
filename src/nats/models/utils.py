@@ -136,7 +136,13 @@ class NAtSLayerCache:
             msk = self.valid_attn_tokens[:, :self.n_attn_blocks_max + 1]
             msk = torch.repeat_interleave(
                 msk, self.nats_block_size, 1
-            )[:, :self.n_attn_tokens_max + 1].transpose(1,2).unsqueeze(-2).bool()
+            )
+
+            if self.op_for_incomplete_chunk != 'gated_delta_net':
+                num_msk_columns = self.n_attn_tokens_max + 1
+            else:
+                num_msk_columns = (self.n_attn_tokens_max + 1) // self.nats_block_size * self.nats_block_size
+            msk = msk[:, :num_msk_columns].transpose(1,2).unsqueeze(-2).bool()
         else:
             if nats_block_types.shape[1] == 1:
                 # in this case, we do normal causal mask
@@ -200,6 +206,7 @@ class NAtSLayerCache:
             n_valid_tokens = triton.cdiv(new_data_len, self.nats_block_size)
             self.valid_attn_tokens = torch.ones([k_state.shape[0], n_valid_tokens, nats_block_types.shape[2]],
                                                  device=self.attn_k.device, dtype=torch.bool)
+            return k_state, v_state
         else:
             if self.attn_k.shape[1] - self.n_attn_tokens_max < new_data_len:
                 n_new_tokens = triton.cdiv(
@@ -221,7 +228,11 @@ class NAtSLayerCache:
                 # new block should be 1
                 self.valid_attn_tokens[:, self.n_attn_blocks_max] = 1
 
-        return self.attn_k[:, :self.n_attn_tokens_max + new_data_len], self.attn_v[:, :self.n_attn_tokens_max + new_data_len]
+        if self.op_for_incomplete_chunk != 'gated_delta_net':
+            return self.attn_k[:, :self.n_attn_tokens_max + new_data_len], self.attn_v[:, :self.n_attn_tokens_max + new_data_len]
+        else:
+            n_tokens = (self.n_attn_tokens_max + new_data_len) // self.nats_block_size * self.nats_block_size
+            return self.attn_k[:, :n_tokens], self.attn_v[:, :n_tokens]
 
     def update_lattn_cache(self,
                            lattn_state: Tuple[torch.Tensor],
