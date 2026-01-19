@@ -539,9 +539,6 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
-            if nats_cache is not None:
-                self.nats_op_types = nats_op_types
-
         elif mode == 'fused_recurrent':
             # we first start with the attn output
             attn_msk = nats_cache.generate_msk(n_data= q_len, nats_block_types=nats_op_types,
@@ -609,7 +606,7 @@ def test_mixed_attn():
     from torch.nn import functional as F
 
     dtype = torch.bfloat16 if check_fp16_dtype() == 'bfloat16' else torch.float16
-    ops_for_incomplete_chunks='attn'
+    ops_for_incomplete_chunks='all'
 
     layer = NeuralAttentionSearchLinearAttnGDN(hidden_size=1024, head_dim=128, num_heads=6, num_attn_heads=12,
                                         expand_v=2,
@@ -630,7 +627,7 @@ def test_mixed_attn():
     cache = [NAtSLayerCache(op_for_incomplete_chunk=ops_for_incomplete_chunks)]
     out2 = torch.empty_like(out1).to(dtype=dtype)
     #nt2 = 256
-    nt2=48
+    nt2=65
     nt1 = nt-nt2
 
     out21, _, cache = layer(input_data[:, :nt1], past_key_values=cache, use_cache=True)
