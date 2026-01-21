@@ -210,7 +210,7 @@ def fused_recurrent_gated_delta_rule_fwd_nats_kernel(
         if USE_GV:
             p_gv += HV*V
         p_beta += HV * (1 if IS_BETA_HEADWISE else V)
-        if not UPDATE_HS_FOR_EACH_ITER:
+        if not ONLY_UPDATE_HIDDEN_STATES:
             p_o += HV*V
     if not ONLY_UPDATE_H:
         if not ONLY_WITH_CURRENT_CHUNK:
