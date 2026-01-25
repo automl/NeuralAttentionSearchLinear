@@ -372,7 +372,7 @@ def nats_mixed_attn_gdn_chunk_inference(
         sliding_window_size=attn_sw_size,
         offset_attn=OFFSET_ATTN,
         compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
-        is_causal=True, store_msk=True,
+        is_causal=True, store_msk=False,
     )
 
     # gated delta net
