@@ -1,27 +1,30 @@
-# Neural Attention Search
+# Neural Attention Search Linear
 
 
-Searching between full transformer models and linear attention models
+This repository introduces a framework that searches for the optimal token-level hybrid attention models.
+Currently, we allow searching for the optimal Gated DeltaNet-Softmax Transformer models.
+
+
 
 usage: 
 create a new conda environment with: 
 ```angular2html
-python==3.11.13 
+conda create -n NAtSL python=3.11
+conda activate NAtSL
+pip install -e .
 ```
-install dependencies, add NeuralAttentionSearchLinear/src to your PYTHONPATH
-then
-```angular2html
-import natsl
+We use the [flame](https://github.com/fla-org/flame.git) package to train the model:
 ```
-such that the model will be registered to the huggingface
+cd experiments
+git clone https://github.com/fla-org/flame.git && cd flame
+pip install -e flame/
+cd ..
+```
 
-## Features
+Then train the model:
+```
+cd experiments
+sbatch slurm_train_model.sh
+```
 
-- TODO
-
-## Credits
-
-This package was created with Cookiecutter_ and the `audreyr/cookiecutter-pypackage`_ project template.
-
-.. _Cookiecutter: https://github.com/audreyr/cookiecutter
-.. _`audreyr/cookiecutter-pypackage`: https://github.com/audreyr/cookiecutter-pypackage
+We could then evaluate the pre-trained model with `experiments/harness.py`

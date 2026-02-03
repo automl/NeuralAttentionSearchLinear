@@ -3,29 +3,24 @@ import os
 from setuptools import setup, find_packages
 
 
-def get_other_requirements():
-    other_requirements = {}
-    for file in os.listdir('./other_requirements'):
-        with open(f'./other_requirements/{file}', encoding='utf-8') as rq:
-            requirements = json.load(rq)
-            other_requirements.update(requirements)
-            return other_requirements
-
 setup(
     version="0.1.0",
-    packages=find_packages(exclude=['tests']),
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
     install_requires=[
-        'numpy<2.0.0',
-        'torch',
-        'transformers==4.43.3',
-        'tiktoken==0.7.0',
-        'mamba-ssm==2.2.2',
-        'causal-conv1d>=1.4.0',
-        'fairscale',
-        'tiktoken==0.6.0',
-        'datasets==2.20.0',
-        'hydra-core',
-        'wandb',
-        'peft'
+        'torch==2.7.1',
+        'triton==3.3.1',
+        'transformers==4.56.1',
+        'wandb==0.21.1',
+        'einops==0.8.1',
+        'flash-attn==2.8.3',
+        'flash-linear-attention==0.4.0',
+        'huggingface-hub==0.36.0',
+        'mamba-ssm==2.2.5',
+        'numpy==2.3.2',
+        'pandas==2.3.1',
+        'tokenizers==0.22.2',
+        'torchtitan==0.0.2',
+        'datasets==3.3.0'
     ],
 )
