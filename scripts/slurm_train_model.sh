@@ -25,7 +25,6 @@ master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$master_addr
 echo "MASTER_ADDR="$MASTER_ADDR
 
-DATA_DIR=$DATA_DIR_NAME
 working_dir=${base}/experiments
 
 export export OMP_NUM_THREADS=32
@@ -50,7 +49,6 @@ srun torchrun --nnodes=$SLURM_JOB_NUM_NODES --nproc_per_node=$SLURM_GPUS_ON_NODE
         --training.num_workers 8 \
         --training.dataset_split train \
         --model.config configs/${MODEL_CONFIG}.json  \
-        --training.cache_dir ${DATA_DIR} \
         --checkpoint.load_step -1 \
         --checkpoint.keep_latest_k 2 \
         --training.skip_nan_inf
