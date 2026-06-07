@@ -567,6 +567,12 @@ def fused_recurrent_gated_delta_rule(
     cu_seqlens_nats:Optional[torch.LongTensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
+    Doing GDN forward in recurrent form. Given that we need to check the status at the end of each NAtS chunk. The recurrent forward
+    process can be divided into three stages.
+    1. We only do recurrent udpate within the same NAtS chunk as the current hidden state. This is equvialant to vanilla recurrent forward.
+    2. We forward with several NAtS chunks. Each time, at the end of the chunk, we check the chunk types and reroll the states if necessary.
+    3. We start a new chunk but cannot finish the current chunk. In this case, we do not need to check the types of the current chunk.
+
     Args:
         q (torch.Tensor):
             queries of shape `[B, T, H, K]`.
@@ -577,12 +583,22 @@ def fused_recurrent_gated_delta_rule(
             GVA is applied if `HV > H`.
         g (torch.Tensor):
             g (decays) of shape `[B, T, HV]`. Default: `None`.
+        g_cumsum (torch.Tensor):
+            cumsum of g in the current chunk of shape `[B, T, HV]`. This value is requried to allow us to 
+            decay the starting of hte current states.
         gk (torch.Tensor):
             gk (decays) of shape `[B, T, HV, K]`. Default: `None`.
         gv (torch.Tensor):
             gv (decays) of shape `[B, T, HV, V]`. Default: `None`.
         beta (torch.Tensor):
             betas of shape `[B, T, HV]`.
+        nats_block_types (torch.Tenspr):
+            nats block types of shape `[B, TNAtS, HNAtS, N_OPTS]`.
+        n_tokens_in_current_block (int):
+            How many tokens are in the current block. This is requried since we need to reroll to the start of each chunk
+            when the current chunk is determined as a softmax attention chunk.
+        nats_block_size (int):
+            NAtS chunk size. Default: 64.
         scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -590,10 +606,25 @@ def fused_recurrent_gated_delta_rule(
             Initial state of shape `[N, HV, K, V]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
+        initial_state_current  (Optional[torch.Tensor]):
+            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            This value records the starting of each chunk such that we can reroll our hidden states back.
+            Default: `None`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
         use_qk_l2norm_in_kernel (Optional[bool]):
             Whether to use L2 normalization in the kernel. Default: `False`.
+        offset_op (int):
+            the offset of the current operation. Default: 1.
+        update_hs_for_each_iter (bool):
+            if we want to update hidden states at each iteration. This is implemented if we decide to do intra-chunk correlation without
+            linear attention, and therefore, we do not need to update hs for each iteartion. Deafult: 'False'.
+        decay_for_non_gdn_blocks (bool):
+            If we want to apply decay value for non-GDN blocks. Default: 'False'.
+        only_update_hidden_states (bool):
+            If we want to only update hidden states without computing the attention outputs. This is implemented if  we decide to do intra-chunk 
+            correlation without linear attention and want to update the hidden states of the linear attention chunks.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.

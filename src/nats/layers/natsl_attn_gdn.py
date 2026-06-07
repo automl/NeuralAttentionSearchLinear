@@ -544,6 +544,12 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             g_cumsum = 0
 
         if mode == 'chunk' and self.training:
+            # Since the hidden states computed by GDN at each time step is actually the start of that chunk. Hence, the output of the last 
+            # linear attention hidden states will be recorded only in final_state. However, this value is required by the following non-linear attention chunks.
+            # to solve this issue, we manually set the last chunk to be activate for all the operations to correctly record all the hidden states.
+            # This setup will not change the computational results, as the last chunk's token will only 
+            # be applied in the intra-chunk correlation computation within the last chunk. 
+
             nats_op_types[:, -1] = 1
             n_nats_blocks = nats_op_types.int().sum(1)
             self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()

@@ -175,12 +175,13 @@ def chunk_gated_delta_rule_nats_inference_fwd(
             keep_wu_as_kv=keep_wu_as_kv,
             n_tokens_in_init_chunk=n_tokens_in_init_chunk,
         )
-        # TODO we need to consider decay here!
         if output_final_state:
             batch_size, num_heads = n_nats_blocks.shape[:2]
             h_chunk_start = h[torch.cumsum(n_nats_blocks[..., offset_delta].flatten(), 0) - 1]
             h_chunk_start = h_chunk_start.view(batch_size, num_heads, k.shape[-1], v.shape[-1])
             n_tokens_in_last_chunk = t_k % nats_block_size
+            # here, we need to consider the cases when we just finished a chunk. In this case, the parallel forwrad function
+            # might not correctly record the last chunk states. Hence, we need to do a manually check here and update the starting of each chunk.
 
             if decay_for_non_gdn_blocks:
                 if n_tokens_in_last_chunk == 0 or nats_block_types.shape[1] <= 1:
@@ -196,6 +197,8 @@ def chunk_gated_delta_rule_nats_inference_fwd(
                     )
                     h_chunk_start = h_chunk_start * decay.view(batch_size, num_heads, 1, 1)
 
+            # If the last chunk is a linear attention token, the actual hidden states is stored as final state, not as op_type_last_chunk,
+            # therefore, we need to load the information from final_state to h_chunk_start.
             if n_tokens_in_last_chunk == 0:
                 assert op_type_last_chunk is not None
                 h_chunk_start = torch.where((op_type_last_chunk[..., offset_delta]>0).view(batch_size, num_heads, 1, 1),
