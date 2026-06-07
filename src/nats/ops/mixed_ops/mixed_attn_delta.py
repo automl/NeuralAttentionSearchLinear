@@ -4,12 +4,22 @@ import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous, input_guard
 
-from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd
+from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd, parallel_attn_bwd_chunk_size
 from nats.ops.delta_rule.chunk import chunk_delta_rule_nats_fwd, chunk_delta_rule_nats_bwd
 
 from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, compute_starting_idx_for_chunks
 
 CHUNK_SIZE = 64
+
+_attn_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _get_attn_stream(device: torch.device) -> torch.cuda.Stream:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _attn_streams:
+        _attn_streams[idx] = torch.cuda.Stream(device=idx)
+    return _attn_streams[idx]
+
 
 @dataclass
 class RunIncompleteBlock:
@@ -27,7 +37,6 @@ all_incomplete_ops: dict[str, RunIncompleteBlock] = {
 }
 
 
-@torch.compile
 class NAtSMixedAttentionDelta(torch.autograd.Function):
     @staticmethod
     @contiguous
@@ -77,7 +86,7 @@ class NAtSMixedAttentionDelta(torch.autograd.Function):
         OFFSET_ATTN = 0
         OFFSET_DELTA = 1
 
-        # attns
+
         o_attn, lse_attn, _ = parallel_attn_nats_fwd(
             q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
             None, scale_attn, NAtS_block_size=nats_block_size,
@@ -85,7 +94,7 @@ class NAtSMixedAttentionDelta(torch.autograd.Function):
             is_causal=True, store_msk=False,
         )
 
-        # gated delta net
+        # delta-net on current stream (overlaps with attn kernel above)
         if lattn_use_qk_l2norm_in_kernel:
             q_lattn, q_rstd_lattn = l2norm_fwd(q_lattn)
             k_lattn, k_rstd_lattn = l2norm_fwd(k_lattn)
@@ -174,7 +183,19 @@ class NAtSMixedAttentionDelta(torch.autograd.Function):
             nats_block_types, nats_block_indices, n_nats_blocks,
         ) = ctx.saved_tensors
 
-        # attns
+        # Pre-compute attn chunk indices on current_stream (before fork) to eliminate
+        # the GPU-CPU sync that prepare_nats_block_indices would cause on attn_stream.
+        _use_dkdv_path = not (ctx.compute_dnats_for_invalid_blocks_attn)
+        if _use_dkdv_path:
+            _bt_dkdv = parallel_attn_bwd_chunk_size(
+                q_attn.shape[-1], ctx.nats_block_size, q_attn.device.index
+            )
+            chunk_indices_attn_nats = prepare_nats_block_indices(
+                n_nats_blocks[..., ctx.OFFSET_ATTN], ctx.nats_block_size, _bt_dkdv
+            )
+        else:
+            chunk_indices_attn_nats = None
+
         dq_attn, dk_attn, dv_attn, dg_attn, dnats_attn = parallel_attn_nats_bwd(
             q_attn, k_attn, v_attn, o_attn, nats_block_types=nats_block_types,
             nats_block_indices=nats_block_indices,
@@ -190,8 +211,10 @@ class NAtSMixedAttentionDelta(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
             is_causal=True,
+            chunk_indices_attn_nats=chunk_indices_attn_nats,
         )
 
+        # Delta bwd on current stream (overlaps with attn dq + dkdv kernels above)
         dq_delta, dk_delta, dv_delta, db, dh0_delta, dnats_delta = chunk_delta_rule_nats_bwd(
             q=q_lattn,
             k=k_lattn,
@@ -217,14 +240,15 @@ class NAtSMixedAttentionDelta(torch.autograd.Function):
             incomplete_block_start_with_ht=ctx.incomplete_block_start_with_ht,
             keep_wu_as_kv=ctx.keep_wu_as_kv,
         )
-        # TODO if we want a uniform dv, we might need some adjustments here!!!
-        #  check how to solve problems for dg for transformer
-        # this should be adjusted based on our choice, we need to check how to solve this
-        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_delta.unsqueeze(-1)], dim=-1)
 
         if ctx.lattn_use_qk_l2norm_in_kernel:
             dq_delta = l2norm_bwd(q_lattn, q_rstd_lattn, dq_delta)
             dk_delta = l2norm_bwd(k_lattn, k_rstd_lattn, dk_delta)
+
+        # TODO if we want a uniform dv, we might need some adjustments here!!!
+        #  check how to solve problems for dg for transformer
+        # this should be adjusted based on our choice, we need to check how to solve this
+        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_delta.unsqueeze(-1)], dim=-1)
         # TODO if we have other linear attn types, we need to adjust them here!
         return dq_attn, dk_attn, dv_attn, \
                dq_delta, dk_delta, dv_delta, \

@@ -52,9 +52,9 @@ def chunk_cumsum_non_gated_chunks_kernel(
 ):
     # and goes towards the end of last nats block
     i_t_, i_gnats = tl.program_id(0), tl.program_id(1)
-
+    i_t_ *= N_CHUNK_PER_NAtS_BLOCK
     off_bh_nats = tl.load(chunk_indices_op_nats + i_t_ * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices_op_nats + i_t_ * 2 + 1).to(tl.int32)
+    i_t = tl.load(chunk_indices_op_nats + i_t_ * 2 + 1).to(tl.int32) // N_CHUNK_PER_NAtS_BLOCK
     i_b = off_bh_nats // HNAtS
     i_hnats = off_bh_nats % HNAtS
 
@@ -91,125 +91,46 @@ def chunk_cumsum_non_gated_chunks_kernel(
     # we only need the cases where i_nats_block_next - i_nats_block > 2, otherwise, if there is only one gated
     # delta block inbetween, there is no need to do this cumulative computing
 
-    if N_CHUNK_PER_NAtS_BLOCK > 1:
-        # TODO this is only a draft implementation, we need to check the correctness of this function!
-        # TOOD this needs to be fixed!!!
-        raise NotImplementedError
-        # In this case, we also need to load the first chunk values
-        #i_nats_block_last = i_nats_block_last + 1
-        if REVERSED:
-            load_msk_first = tl.arange(0, N_CHUNK_PER_NAtS_BLOCK) < (N_CHUNK_PER_NAtS_BLOCK - 1) & (i_nats_block_last > 1)[None, :]
-            bg_first_value = tl.load(
-                g_cumsum + stride_g_t * (BT * tl.arange(0, N_CHUNK_PER_NAtS_BLOCK) + i_nats_block * NAtS_BLOCK_SIZE - NAtS_BLOCK_SIZE), mask=load_msk_first, other=0
-            )
-            pg_cumsum = tl.make_block_ptr(
-                g_cumsum + stride_g_t * (i_nats_block * NAtS_BLOCK_SIZE - NAtS_BLOCK_SIZE), (T), (stride_g_t, ), (0, ), (NAtS_BLOCK_SIZE, ), (0, )
-            )
-            bg_first_values_cumsum = tl.cumsum(bg_first_value, 0)
 
-            bg_first_value_sum = tl.sum(bg_first_values_cumsum)
-            bg_first_values_cumsum_expanded = tl.reshape(
-                tl.broadcast_to(bg_first_values_cumsum[:, None], (N_CHUNK_PER_NAtS_BLOCK, BT)), [])
-            bg_cumsum = tl.load(pg_cumsum, boundary_check=(0,))
-            bg_cumsum += bg_first_values_cumsum_expanded
-            tl.store(bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
-            n_iters = i_nats_block - i_nats_block_last - 1
-            for i in n_iters:
-                pg_first_values = tl.make_block_ptr(
-                    g_cumsum + (i_nats_block - 1 - i) * stride_g_t * NAtS_BLOCK_SIZE, (T, ),
-                    (stride_g_t * BT), (0,), (N_CHUNK_PER_NAtS_BLOCK,),
-                )
-                bg_first_values = tl.load(pg_first_values)
-                bg_first_values_cumsum = tl.cumsum(bg_first_values, 0, )
-                bg_first_values_cumsum += bg_first_value_sum
-                bg_first_value_sum += tl.sum(bg_first_values)
-
-                pg_cumsum = tl.make_block_ptr(
-                    g_cumsum  + (i_nats_block - 1 - i) * stride_g_t * NAtS_BLOCK_SIZE, (T, ), (stride_g_t,), (i * NAtS_BLOCK_SIZE,),
-                    (NAtS_BLOCK_SIZE,), (0,)
-                )
-                bg_cumsum = tl.load(pg_cumsum, boundary_check=(0,))
-                bg_first_values_cumsum_expanded = tl.reshape(
-                    tl.broadcast_to(bg_first_values_cumsum[:, None], (N_CHUNK_PER_NAtS_BLOCK, BT)), [])
-                bg_cumsum += bg_first_values_cumsum_expanded
-                tl.store(pg_cumsum, bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
-        else:
-            i_nats_block_last = tl.where(i_nats_block_last < 0, 0, i_nats_block_last)
-            #n_iters = i_nats_block - i_nats_block_last
-
-            g_cumsum += stride_g_t * i_nats_block_last * NAtS_BLOCK_SIZE
-            load_msk_first = (tl.arange(0, N_CHUNK_PER_NAtS_BLOCK)) > 0 & \
-                              (tl.arange(0, N_CHUNK_PER_NAtS_BLOCK) * BT + i_nats_block_last * NAtS_BLOCK_SIZE < T)
-            bg_last_values = tl.load(
-                g_cumsum + stride_g_t * (BT * tl.arange(0, N_CHUNK_PER_NAtS_BLOCK) + T-1), mask=load_msk_first, other=0
+    n_iters = ((i_nats_block - i_nats_block_last) - 1) * N_CHUNK_PER_NAtS_BLOCK
+    i_nats_block *= N_CHUNK_PER_NAtS_BLOCK
+    if REVERSED:
+        bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT * stride_g_t , mask=i_nats_block >= 0, other=0)
+        #b_g = tl.zeros([BT], dtype=bg_first_cumsum.dtype)
+        for i in range(n_iters):
+            first_idx = (i_nats_block -1 - i) * BT
+            bg_first = tl.load(g_cumsum + first_idx * stride_g_t)
+            #p_g = tl.make_block_ptr(
+            #    g_cumsum, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
+            #)
+            #b_g = tl.load(p_g, boundary_check=(0,))
+            #b_g += bg_first_cumsum
+            b_g = tl.full([BT], bg_first_cumsum, dtype=bg_first_cumsum.dtype)
+            p_g_out = tl.make_block_ptr(
+                g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
             )
-            pg_cumsum = tl.make_block_ptr(
-                g_cumsum, (T - i_nats_block_last * NAtS_BLOCK_SIZE), (stride_g_t, ), (0, ), (NAtS_BLOCK_SIZE, ), (0, )
-            )
-            bg_last_values_cumsum = tl.cumsum(bg_last_values, 0)
-            bg_last_value_sum = tl.sum(bg_last_values)
-            bg_last_values_cumsum_expanded = tl.reshape(tl.broadcast_to(bg_last_values_cumsum[:, None], (N_CHUNK_PER_NAtS_BLOCK, BT)), [])
-            bg_cumsum = tl.load(pg_cumsum, boundary_check=(0,))
-            bg_cumsum += bg_last_values_cumsum_expanded
-            tl.store(bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
-            n_iters = i_nats_block - i_nats_block_last - 1
-            for i in n_iters:
-                pg_last_values = tl.make_block_ptr(
-                    g_cumsum + (i + 1) * stride_g_t * NAtS_BLOCK_SIZE, (T - i_nats_block_last * NAtS_BLOCK_SIZE),
-                    (stride_g_t * BT), (0, ), (N_CHUNK_PER_NAtS_BLOCK, ),
-                )
-                bg_last_values = tl.load(pg_last_values)
-                bg_last_values_cumsum = tl.cumsum(bg_last_values, 0,)
-                bg_last_values_cumsum += bg_last_value_sum
-                bg_last_value_sum += tl.sum(bg_last_values)
-
-                pg_cumsum = tl.make_block_ptr(
-                    g_cumsum, (T - i_nats_block_last * NAtS_BLOCK_SIZE), (stride_g_t,), (i * NAtS_BLOCK_SIZE,), (NAtS_BLOCK_SIZE,), (0,)
-                )
-                bg_cumsum = tl.load(pg_cumsum, boundary_check=(0,))
-                bg_last_values_cumsum_expanded = tl.reshape(
-                    tl.broadcast_to(bg_last_values_cumsum[:, None], (N_CHUNK_PER_NAtS_BLOCK, BT)), [])
-                bg_cumsum += bg_last_values_cumsum_expanded
-                tl.store(pg_cumsum, bg_cumsum.to(pg_cumsum.dtype.element_ty), boundary_check=(0,))
+            tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
+            bg_first_cumsum += bg_first
     else:
-        n_iters = i_nats_block - i_nats_block_last - 1
-        if REVERSED:
-            bg_first_cumsum = tl.load(g_cumsum + i_nats_block * BT * stride_g_t , mask=i_nats_block >= 0, other=0)
-            #b_g = tl.zeros([BT], dtype=bg_first_cumsum.dtype)
-            for i in range(n_iters):
-                first_idx = (i_nats_block -1 - i) * BT
-                bg_first = tl.load(g_cumsum + first_idx * stride_g_t)
-                #p_g = tl.make_block_ptr(
-                #    g_cumsum, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
-                #)
-                #b_g = tl.load(p_g, boundary_check=(0,))
-                #b_g += bg_first_cumsum
-                b_g = tl.full([BT], bg_first_cumsum, dtype=bg_first_cumsum.dtype)
-                p_g_out = tl.make_block_ptr(
-                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block -1 - i) * BT,), (BT,), (0,)
-                )
-                tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
-                bg_first_cumsum += bg_first
-        else:
-            i_nats_block_last += 1  # we start with the first gated block and extract its last element
+        i_nats_block_last += 1  # we start with the first gated block and extract its last element
+        i_nats_block_last *= N_CHUNK_PER_NAtS_BLOCK
+        last_idx = min(i_nats_block_last * BT + BT, T) - 1
+        bg_last_cumsum = tl.load(g_cumsum + last_idx * stride_g_t, )
+        #b_g = tl.zeros([BT], dtype=bg_last_cumsum.dtype)
 
-            last_idx = min(i_nats_block_last * BT + BT, T) - 1
-            bg_last_cumsum = tl.load(g_cumsum + last_idx * stride_g_t, )
-            #b_g = tl.zeros([BT], dtype=bg_last_cumsum.dtype)
-
-            for i in range(n_iters):
-                last_idx = min((i_nats_block_last + i + 1) * BT + BT, T) - 1
-                bg_last = tl.load(g_cumsum + last_idx * stride_g_t, )
-                #p_g = tl.make_block_ptr(
-                #    g_cumsum, (T, ), (stride_g_t, ), ((i_nats_block_last + 1 + i) * BT, ), (BT, ), (0,)
-                #)
-                #b_g = tl.load(p_g, boundary_check=(0,))
-                b_g = tl.full([BT], bg_last_cumsum, dtype=bg_last_cumsum.dtype)
-                p_g_out = tl.make_block_ptr(
-                    g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block_last + 1 + i) * BT,), (BT,), (0,)
-                )
-                tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
-                bg_last_cumsum += bg_last
+        for i in range(n_iters):
+            last_idx = min((i_nats_block_last + i + 1) * BT + BT, T) - 1
+            bg_last = tl.load(g_cumsum + last_idx * stride_g_t, )
+            #p_g = tl.make_block_ptr(
+            #    g_cumsum, (T, ), (stride_g_t, ), ((i_nats_block_last + 1 + i) * BT, ), (BT, ), (0,)
+            #)
+            #b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.full([BT], bg_last_cumsum, dtype=bg_last_cumsum.dtype)
+            p_g_out = tl.make_block_ptr(
+                g_cumsum_out, (T,), (stride_g_t,), ((i_nats_block_last + 1 + i) * BT,), (BT,), (0,)
+            )
+            tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
+            bg_last_cumsum += bg_last
 
 
 def chunk_cumsum_non_gated_chunks(g_cumsum: torch.Tensor,
@@ -249,7 +170,7 @@ def chunk_cumsum_non_gated_chunks(g_cumsum: torch.Tensor,
     B, TNAtS, HNAtS, n_opts = nats_block_types.shape
     GNAtS = H // HNAtS
 
-    grid = (len(chunk_indices_op_nats), GNAtS)
+    grid = (len(chunk_indices_op_nats) // (nats_block_size // chunk_size), GNAtS)
     g_cumsum_out = torch.zeros_like(g_cumsum)
     chunk_cumsum_non_gated_chunks_kernel[grid](g_cumsum, g_cumsum_out, nats_block_types, nats_block_indices, cu_seqlens, cu_seqlens_nats,
                                         chunk_indices_op_nats, T, TNAtS, H, HNAtS, GNAtS, BT=chunk_size,
@@ -275,7 +196,7 @@ def test_cumsum():
     delta_offset = 1
     K = 128
     V = 256
-    NATS_Chunk = 64
+    NATS_Chunk = 128
     chunk_size = 64
     T_NAtS = triton.cdiv(T, NATS_Chunk)
     device = torch.device('cuda')
@@ -310,15 +231,17 @@ def test_cumsum():
                                           )
     last_block_is_delta = True
     current_block_is_delta = True
+    nats_block_types1 = nats_block_types.repeat_interleave(nats_block_size// chunk_size, 1)
+
     #"""
     for b in range(B):
         for h in range(H):
             g_cumsum = 0
-            for i in range(T_NAtS):
-                current_block_is_delta = nats_block_types[b,i, h, offset_delta]
+            for i in range(T_NAtS * (nats_block_size// chunk_size)):
+                current_block_is_delta = nats_block_types1[b,i, h, offset_delta]
 
-                g_in1 = g_in[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
-                g_out1 = gout1[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                g_in1 = g_in[b, i * chunk_size: i * chunk_size + chunk_size,h, ]
+                g_out1 = gout1[b, i * chunk_size: i * chunk_size + chunk_size,h, ]
 
                 if last_block_is_delta:
                     g_cumsum = 0
@@ -344,11 +267,11 @@ def test_cumsum():
     for b in range(B):
         for h in range(H):
             g_cumsum = 0
-            for i in range(T_NAtS-1, -1, -1):
-                current_block_is_delta = nats_block_types[b,i, h, offset_delta]
+            for i in range(T_NAtS * (nats_block_size// chunk_size) -1, -1, -1):
+                current_block_is_delta = nats_block_types1[b,i, h, offset_delta]
 
-                g_in1 = g_in[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
-                g_out1 = gout2[b, i * nats_block_size: i * nats_block_size + nats_block_size,h, ]
+                g_in1 = g_in[b, i * chunk_size: i * chunk_size + chunk_size,h, ]
+                g_out1 = gout2[b, i * chunk_size: i * chunk_size + chunk_size,h, ]
                 if current_block_is_delta:
                     g_cumsum = 0
                     print((g_in1 - g_out1 + g_cumsum).abs().sum())
@@ -359,9 +282,6 @@ def test_cumsum():
                 g_cumsum += g_in1[..., 0]
                 next_block_is_delta = current_block_is_delta
     # """
-
-    import pdb
-    pdb.set_trace()
 
 
 

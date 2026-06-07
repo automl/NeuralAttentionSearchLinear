@@ -19,10 +19,6 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, compute_starting_idx_for_chunks
 
 
-# TODO in the current implementation, we use O_{t} = Q_{t} @ h_{t0} + p_t @ (v_t - w_t @ h_t0)
-#  However, an alternative could also be   O_{t} = Q_{t} @ h_{t0} + p_t @ (v_t), which requires a
-#  different fwd and bwd implementation...
-
 def chunk_gated_delta_rule_nats_fwd(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -46,7 +42,7 @@ def chunk_gated_delta_rule_nats_fwd(
         compute_incomplete_chunk_scores: bool = False,
         incomplete_block_start_with_ht: bool = True,
         keep_wu_as_kv: bool = False,
-        chunk_size: int = 64
+        chunk_size: int = 64,
 ):
     assert nats_block_size >= chunk_size, "The current implementaion only allows one nats block within each delta " \
                                           "computaionl chunk!!!"
@@ -457,7 +453,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, dh0, None, None, None, None, None, None, None, None, None, None, None
 
 
 @torch.compiler.disable

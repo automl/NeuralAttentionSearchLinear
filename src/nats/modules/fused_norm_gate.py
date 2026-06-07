@@ -1362,6 +1362,10 @@ class FusedMultiInputRMSNormGated(nn.Module):
             device: Optional[torch.device] = None,
             dtype: Optional[torch.dtype] = None,
     ) -> FusedMultiInputRMSNormGated:
+        """
+        This function is implemented to normalize two input values instead of two. The two input values corresponds to the
+        output of softmax attention outputs and linear attention outputs correspondingly. 
+        """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 

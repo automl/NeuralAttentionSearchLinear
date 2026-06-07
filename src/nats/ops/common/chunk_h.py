@@ -69,7 +69,6 @@ def chunk_fwd_kernel_h(
         bos, eos = i_n * T, i_n * T + T
         NT, NS = tl.cdiv(T, BT), tl.cdiv(T, BS)
         boh = i_n * NS
-    NTS = BS // BT
 
     if USE_G_GAMMA:
         # decay rate given the head index

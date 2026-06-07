@@ -11,8 +11,7 @@ from nats.models.natsl_transformer_based import (
     NeuralAttentionSearchLinearTransformerBasedForCausalLM
 )
 
-
 __all__ = ['NeuralAttentionSearchLinearAttnGDNForCausalLM', 'NeuralAttentionSearchLinearAttnGDNModel',
            'NeuralAttentionSearchLinearAttnDeltaForCausalLM', 'NeuralAttentionSearchLinearAttnDeltaModel',
-           'NeuralAttentionSearchLinearTransformerBasedModel', 'NeuralAttentionSearchLinearTransformerBasedForCausalLM'
+           'NeuralAttentionSearchLinearTransformerBasedModel', 'NeuralAttentionSearchLinearTransformerBasedForCausalLM',
            ]

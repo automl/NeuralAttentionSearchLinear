@@ -37,13 +37,83 @@ class NAtSLayerCache:
     def __init__(self,
                  seen_tokens: int = 0,
                  n_tokens_in_nats_block: int = 0,
-                 n_attn_blocks: [torch.Tensor] = None,
+                 n_attn_blocks: torch.Tensor | None = None,
                  nats_block_size: int = 64,
                  attn_offset: int = 0,
                  recurrent_offset: int = 1,
                  n_ops: int = 2,
                  op_for_incomplete_chunk: str = 'attn'
                  ) -> 'NAtSLayerCache':
+        """
+        A NAtS Layer Cache. This class is implemented to manage all the caches implemented in NAtSL. Depending on which operation we use for 
+        incomplete chunks, NAtSL stores and rerolls its cache in different ways. 
+        If op_for_incomplete_chunk is 'all', both attn and linear attn caches will be updated at each iteartion and we remove new KV attn values if the new 
+        chunk is a linear attention chunk or reroll the linear attetnion's KV values if the new chunk is a softmax attetnion chunk. Hence, in addition to softmax 
+        KV cache, linear attention hidden state at the current time step, we also needs to store linear attention's hidden state at the start of the chunk.
+        Additionally, since we need to ensure that the linear attention chunks align with the NAtS chunks when we do contiual pre-filling with some tokens 
+        remaining in the last chunk, we cannot directly start another linear attention parallel forward process. Hence, we first concatnate the old linear attention
+        related information (l_attn_k, l_attn_v, lattn_g, lattn_delta) to the corresponding values of the new tokens and then run parallel forward pass with 
+        the concatnated information. Additionally, if the intra-chunk operation does not involve linear attention, we also need to record all the linear attention 
+        related information. Since we no longer compute the intermedaite hidden state at each time step but only update an entire chunk with parallel form at the 
+        end of each chunk.
+
+
+        Attributes:
+            attn_k: torch.Tensor | None,
+                Attention K cache
+            attn_v: torch.Tensor | None,
+                Attention V cache
+            l_attn_k: torch.Tensor | None,
+                Linear Attention K cache, with a shape of [batch_size, NAtS_chunk_size, n_heads, head_dims_k], 
+                used to concatate with the new linear attention K tokens for parallel chunking computation. 
+            l_attn_v: torch.Tensor | None,
+                Linear Attention V cache, with a shape of [batch_size, NAtS_chunk_size, n_heads, head_dims_k],
+                used to concatate with the new linear attention V tokens for parallel chunking computation. 
+            lattn_g: torch.Tensor | None,
+                gate value of linear attentionm with a shape of [batch_size, NAtS_chunk_size, n_heads], 
+                used to concatate with the new linear attention g tokens for parallel chunking computation. 
+            lattn_beta: torch.Tensor | None,
+                beta value of linear attention with a shape of [batch_size, NAtS_chunk_size, n_heads],
+                used to concatate with the new linear attention beta tokens for parallel chunking computation. 
+            recurrent_state: torch.Tensor | None,
+                linear attention recurrent state at the current stage. This value is not requried if the operations for incomplete chunks does not contain linear attention 
+            recurrent_state_block_start: torch.Tensor | None,
+                linear attention recurrent state in the beginning of the current chunk. This value is stored to ensure that the recurrent_state can be restored if the new chunk
+                is not a linear attention chunk.
+            block_type_state: torch.Tensor,
+                this value stored the input feature maps that used to compute the attention scores with a shape of [batch_size, NAtS_chunk_size, model_dim]. Here we store the entire 
+                feature map in the chunk. We could also only store the current mean values of the feature maps. However, to ensure that the model provides consistent results, we still 
+                store the entire chunk here.
+            conv_state: torch.Tensor,
+                The new convolutional state to cache.
+            ffn_state: torch.Tenspr,
+                The new feed-forward state to cache.
+            nats_block_size: int,
+                nats block sizes
+            n_attn_blocks_max: int,
+                maximal number of softmax attention chunks. We note that this value only contain the complete chunks that are already classified as softmax attention chunks. This
+                value helps us to extract the KV cache values for softmax attention
+            n_attn_tokens_max: int,
+                maximal number of softmax attention tokens. This can be computed as n_attn_blocks_max * nats_chunk_size + n_tokens_in_new_chunk
+            n_ops: int,
+                number of operations in our search space
+            attn_offset: int,
+                offset for softmax attentions
+            recurrent_offset: int,
+                offset for linear attention operations 
+            valid_attn_tokens: torch.Tensor
+                Since different batches (or different heads within the same batch) might contains different number of softmax attention chunks, we need to record these values to show 
+                which tokens are actually softmax attention tokens. This can then be directly applied as an attention mask for softmax attention operations 
+            op_for_incomplete_chunk: str,
+                operations for incomplete chunks, currently, we have 'all': both linear attention and softmax attentions are involved, 'attn': only softmax attention is considered, 
+                'gated_delta_net', only gated delta net (or linear attention is involved)
+            g_cumsum: torch.Tenspr,
+                cumulative sum of the g values within the current block. Since we might need to decay the hidden states regardless of the current chunk is a lienar attention chunk 
+                or softmax attention tokens, we compute cumulative sum of g to decay properly. 
+            n_observed_tokens: int,
+                number of obsered tokens for this cache, used for positional encoding. 
+            
+        """
         super().__init__()
         self.seen_tokens = seen_tokens
 
@@ -51,16 +121,16 @@ class NAtSLayerCache:
         self.attn_v: Optional[torch.Tensor] = None
         self.l_attn_k: Optional[torch.Tensor] = None
         self.l_attn_v: Optional[torch.Tensor] = None
-        self.g_lattn :Optional[torch.Tensor] = None
-        self.beta_lattn: Optional[torch.Tensor] = None
+        self.lattn_g :Optional[torch.Tensor] = None
+        self.lattn_beta: Optional[torch.Tensor] = None
         self.recurrent_state: Optional[torch.Tensor] = None
         self.recurrent_state_block_start: Optional[torch.Tensor] = None
         self.block_type_state: Optional[torch.Tensor] = None
         self.conv_state = None
         self.ffn_state = None
         # TODO the current implementation only involves the cases where all the sequence in the batch starts with the
-        # same opearionts
-        self._n_tokens_in_nats_block = n_tokens_in_nats_block
+        # same amount of tokens in new chunk size. In which case, _n_tokens_in_nats_block should be a tensor instead of a scalar value
+        self._n_tokens_in_nats_block = n_tokens_in_nats_block # Number of tokens in the most recent chunk (value between (0, nats_block_size))
         self.nats_block_size = nats_block_size
         self.block_type_state_logits = None
 
@@ -79,6 +149,9 @@ class NAtSLayerCache:
         self.n_observed_tokens = 0
 
     def lazy_initialization(self, key_states: torch.Tensor):
+        """
+        initialize all the hidden states into initial states
+        """
         self.seen_tokens = 0
 
         self.attn_k: Optional[torch.Tensor] = None
@@ -90,8 +163,6 @@ class NAtSLayerCache:
         self.block_type_state: Optional[torch.Tensor] = None
         self.conv_state = None
         self.ffn_state = None
-        # TODO the current implementation only involves the cases where all the sequence in the batch starts with the
-        # same opearionts
         self._n_tokens_in_nats_block = 0
         self.block_type_state_logits = None
 
@@ -102,10 +173,16 @@ class NAtSLayerCache:
         self.n_groups_nats = None
         self.valid_attn_tokens = None
         self.g_cumsum = None
-        # TODO check if we actually need n_nats_blocks or something else!!!
         self.n_observed_tokens = 0
 
     def update_attn_types(self, input_hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        update the hidden states that can be later applied to check the chunk types
+
+        Args:
+            input_hidden_states: torch.Tensor
+                input hidden states, i.e., the archtecture input. 
+        """
         B, T, D = input_hidden_states.shape
 
         if self.block_type_state is None:
@@ -132,6 +209,28 @@ class NAtSLayerCache:
     def generate_msk(self, n_data:int=1, nats_block_types: Optional[torch.Tensor] = None,
                      compute_incomplete_chunk: bool=False,
                      ):
+        """
+        generate a mask used by softmax attention operations. If a KV cache contains sequence with different length, 
+        we put all tokens of incomplete chunks to the end of the last complete softmax chunks. For instance, if we have
+        an observed sequence of 
+        [[sa, sa, new_token],
+         [sa, la, new_token]]
+        then the corresponding mask should be:
+        [[T, T, T],
+         [T, F, T]]
+        We need to call this function after updaing the softmax KV cache values. 
+         
+        Args:
+            n_data: int
+                data sequence lenth of new input data
+            nats_block_types: torch.Tensor
+                the types of the new chunk blocks, this can be applied if n_data + n_token_in_chunks is larger than 
+                the chunk size
+            compute_incomplete_chunk: bool
+                if we would like to compute intra-chunk correlation with softmax attention. This item determines if we want 
+                to set the incomplete chunks as True or False.
+            
+        """
         if n_data == 1:
             msk = self.valid_attn_tokens[:, :self.n_attn_blocks_max + 1]
             msk = torch.repeat_interleave(
@@ -191,6 +290,15 @@ class NAtSLayerCache:
                           attn_state: Tuple[torch.Tensor],
                           nats_block_types: torch.Tensor,
                           ):
+        """
+        Update softmax attention KV cache given the types of new nats chunks
+
+        Args:
+            attn_states: Tuple[torch.Tensor, torch.Tensor],
+                softmax attention states, storing the K, V values of current tokens accordingly
+            nats_block_types: torch.Tensor,
+                attention types of new token chunk
+        """
         k_state, v_state = attn_state
         new_data_len = k_state.shape[1]
 
@@ -240,6 +348,23 @@ class NAtSLayerCache:
                            lattn_g: Optional[torch.Tensor],
                            mode: str,
                            ops_for_incomplete_chunks: str):
+        """
+        Update linear attention realted states given the types of new nats chunks. We need to record intermediate beta
+        and g values in case we want to do coninuing pre-filling, these intermediate values are applied to do parallel forward
+        with hidden_state_chunk_start. Hence, all the values of the current incomplete chunks are stored
+
+        Args:
+            lattn_state: Tuple[torch.Tensor, torch.Tensor],
+                Linear attention states, storing the K, V values of current tokens accordingly
+            lattn_beta: torch.Tensor,
+                beta value of the linear attention
+            lattn_g: torch.Tensor,
+                decay of the linaer attention
+            mode: str,
+                forward mode. It can be parallel or recurrent
+            ops_for_incomplete_chunks: str, 
+                operations for incomplete chunks. This can be 'attn', 'gated_delta_net', or 'all'
+        """
         lattn_k, lattn_v = lattn_state
         T_lattn = lattn_k.shape[1]
         if self.l_attn_k is None:
@@ -251,10 +376,11 @@ class NAtSLayerCache:
                 lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2], lattn_v.shape[3],
                 device=lattn_k.device, dtype=lattn_k.dtype
             )
-            self.lattn_beta = torch.zeros(
-                lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2],
-                device=lattn_k.device, dtype=lattn_beta.dtype
-            )
+            if lattn_beta is not None:
+                self.lattn_beta = torch.zeros(
+                    lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2],
+                    device=lattn_k.device, dtype=lattn_beta.dtype
+                )
             if lattn_g is not None:
                 self.lattn_g = torch.zeros(
                     lattn_k.shape[0], self.nats_block_size, lattn_k.shape[2],
@@ -267,14 +393,16 @@ class NAtSLayerCache:
                 T_remains = T_lattn % self.nats_block_size
                 self.l_attn_k[:, :T_remains] = lattn_k[:, -T_remains:]
                 self.l_attn_v[:, :T_remains] = lattn_v[:, -T_remains:]
-                self.lattn_beta[:,:T_remains] = lattn_beta[:, -T_remains:]
+                if lattn_beta is not None:
+                    self.lattn_beta[:,:T_remains] = lattn_beta[:, -T_remains:]
                 if lattn_g is not None:
                     self.lattn_g[:,:T_remains] = lattn_g[:, -T_remains:]
                 return lattn_k, lattn_v, lattn_beta, lattn_g
             else:
                 self.l_attn_k[:, :T_lattn] = lattn_k
                 self.l_attn_v[:, :T_lattn] = lattn_v
-                self.lattn_beta[:, :T_lattn] = lattn_beta
+                if lattn_beta is not None:
+                    self.lattn_beta[:, :T_lattn] = lattn_beta
                 if lattn_g is not None:
                     self.lattn_g[:, :T_lattn] = lattn_g
                 return lattn_k, lattn_v, lattn_beta, lattn_g
@@ -285,7 +413,8 @@ class NAtSLayerCache:
                 T_remains = T_new % self.nats_block_size
                 self.l_attn_k[:, :T_remains] = lattn_k[:, -T_remains:]
                 self.l_attn_v[:, :T_remains] = lattn_v[:, -T_remains:]
-                self.lattn_beta[:, :T_remains] = lattn_beta[:, -T_remains:]
+                if lattn_beta is not None:
+                    self.lattn_beta[:, :T_remains] = lattn_beta[:, -T_remains:]
                 if lattn_g is not None:
                     self.lattn_g[:, :T_remains] = lattn_g[:, -T_remains:]
                 if mode == 'chunk' or ops_for_incomplete_chunks == 'attn':
@@ -298,10 +427,13 @@ class NAtSLayerCache:
                         [self.l_attn_v[:, :self._n_tokens_in_nats_block], lattn_v],
                         dim=1
                     )
-                    lattn_beta_new = torch.cat(
-                        [self.lattn_beta[:, :self._n_tokens_in_nats_block], lattn_beta],
-                        dim=1
-                    )
+                    if lattn_beta is not None:
+                        lattn_beta_new = torch.cat(
+                            [self.lattn_beta[:, :self._n_tokens_in_nats_block], lattn_beta],
+                            dim=1
+                        )
+                    else:
+                        lattn_beta_new = None
                     if lattn_g is not None:
                         lattn_g_new = torch.cat(
                             [self.lattn_g[:, :self._n_tokens_in_nats_block], lattn_g],
@@ -317,7 +449,8 @@ class NAtSLayerCache:
                 t_end = T_new
                 self.l_attn_k[:, t_start:t_end] = lattn_k
                 self.l_attn_v[:, t_start:t_end] = lattn_v
-                self.lattn_beta[:, t_start:t_end] = lattn_beta
+                if lattn_beta is not None:
+                    self.lattn_beta[:, t_start:t_end] = lattn_beta
                 if lattn_g is not None:
                     self.lattn_g[:, t_start:t_end] = lattn_g
 
@@ -330,11 +463,40 @@ class NAtSLayerCache:
                conv_state: Optional[Tuple[torch.Tensor]] = None,
                nats_block_types: Optional[torch.Tensor] = None,
                ffn_state: Optional[Tuple[torch.Tensor]] = None,
-               l_attn_state: Optional[Tuple[torch.Tensor]] = None,
                g: Optional[torch.Tensor] = None,
                n_new_tokens: Optional[int] = 0,
                cache_kwargs: Optional[Dict[str, Any]] = None,
                ):
+        """
+        Update the hideen states of both linear and softmax attentions. Since adding new values to the caches are done within the funciton 
+        update_attn_cache and update_lattn_cache. This function is called only for post-update. For instance, reroll the hidden states to the start 
+        if the current token is a softmax attention token or removing new KV caches of linear attention blocks.
+        Additionally, we need to fill the most recent KV cache block values to the end of the current sequecne.
+        For instance, if we have the following cache arrangement:
+        [[T, T, T],
+         [T, F, T]]
+        Since the new chunk is a softmax token, we need to move the 3rd chunk in head 2 to place 2:
+        [[T, T, T],
+         [T, T, F]]
+
+        Args:
+            recurrent_state: torch.Tensor,
+                recurrent hidden state of linear attention at the current time step
+            recurrent_state_block_start: torch.Tensor,
+                recurrent hidden state of linear attention at the start of the current chunk such that we can recover to this value
+            attn_state: Tuple[torch.Tensor, torch.Tensor],
+                KV cache values of softmax attention operations
+            conv_state: Tuple[torch.Tenspr],
+                intermediate states of convolutional layers
+            nats_block_types: torch.Tensor
+                attention types of each nats blocks
+            ffn_state: torch.Tensor
+                ffn states
+            g: torch.Tensor,
+                decay values of linear attention
+            n_new_tokens: int,
+                number of new tokens at this stage
+        """
         if self.n_groups_nats is None:
             k_state = attn_state[0]
             nhead_attn = k_state.shape[2]
@@ -508,9 +670,7 @@ class NAtSLayerCache:
 
 class NAtSCache(transformers.cache_utils.Cache):
     """
-    A cache used for storing hidden states produced by flash linear attention models.
-
-    It stores the states of each layer as the tensor of shape `[batch_size, key_dim, value_dim]`.
+    A cache used for storing hidden states produced by flash linear attention models and KV cache values for softmax attention models
     """
 
     is_compileable = True
@@ -576,7 +736,6 @@ class NAtSCache(transformers.cache_utils.Cache):
     def update(
             self,
             recurrent_state: Optional[Tuple[torch.Tensor]] = None,
-            recurrent_state_block_start: Optional[tuple[torch.Tensor]] = None,
             attn_state: Optional[Tuple[torch.Tensor]] = None,
             conv_state: Optional[Tuple[torch.Tensor]] = None,
             nats_block_types: Optional[torch.Tensor] = None,
@@ -587,20 +746,26 @@ class NAtSCache(transformers.cache_utils.Cache):
             cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
+        update the hidden state of NAtS cache. This function is implemented to be compatible with the corresponding FLA layers.
+        However, to update the token-wise hybrid NAts layer, please directly call the function 'add_natsl_layer_cache' to add new layers
+        and directly read the layer caches from `self.states` to updates its internal caches. 
+
         Args:
-            recurrent_state (`torch.Tensor`):
-                The new recurrent state to cache.
-            attn_state (`Tuple[torch.Tensor]`):
+            recurrent_state: torch.Tensor:
+                The new recurrent state at the current time step.
+            recurrent_state_block_start: torch.Tensor
+                Start of the recurrent states that we can recover to.
+            attn_state: Tuple[torch.Tensor],
                 The new attention key/value states to cache.
-            conv_state (`Tuple[torch.Tensor]`):
+            conv_state: Tuple[torch.Tensor],
                 The new convolution state to cache.
-            ffn_state (`Tuple[torch.Tensor]`):
+            ffn_state: Tuple[torch.Tensor],
                 The new feed-forward state to cache.
-            layer_idx (`int`, defaults to 0):
+            layer_idx: int,
                 The index of the layer to cache the states for.
-            offset (`int`, defaults to 1):
+            offset: int,
                 The number of new tokens being processed.
-            cache_kwargs (`Dict[str, Any]`):
+            cache_kwargs: Dict[str, Any],
                 Additional arguments for the cache subclass.
 
         Return:
@@ -618,16 +783,11 @@ class NAtSCache(transformers.cache_utils.Cache):
             # update the number of seen tokens
             if layer_idx == 0:
                 self._seen_tokens += offset
-            if attn_state is not None:
-                if window_size is not None and input_size > window_size:
-                    attn_state = [state[:, -window_size:].contiguous() for state in attn_state]
-            state = dict(
-                recurrent_state=recurrent_state,
-                attn_state=attn_state,
-                conv_state=conv_state,
-                ffn_state=ffn_state
+            self.add_natsl_layer_cache(
+                seen_tokens=self._seen_tokens,
+                n_tokens_in_nats_block=0,
+                nats_block_size=self.nats_block_size
             )
-            self.states.append(state)
         else:
             # update the number of seen tokens
             if layer_idx == len(self.states) - 1:
@@ -717,7 +877,6 @@ def test_nats_cache_attn():
     cache_k = cache.attn_k
 
     n_attn_blocks_max = cache.n_attn_blocks.max()
-    """
     for b in range(B):
         for h1 in range(HNAtS):
             for h2 in range(H//HNAtS):
@@ -746,10 +905,6 @@ def test_nats_cache_attn():
 
                 valid_token = cache.valid_attn_tokens[b,(i_cache + 1) * nats_block_size:, h1]
                 assert valid_token.int().sum() == 0
-    """
-
-    import pdb
-    pdb.set_trace()
 
 
 def test_nats_cache_attn_chunk_wise():
@@ -813,13 +968,8 @@ def test_nats_cache_attn_chunk_wise():
 
     n_tokens_in_nats_block1 = cache1._n_tokens_in_nats_block
     n_tokens_in_nats_block2 = cache2._n_tokens_in_nats_block
-    import pdb
-    pdb.set_trace()
+
     assert (n_tokens_in_nats_block1 == n_tokens_in_nats_block2)
-
-    import pdb
-    pdb.set_trace()
-
 
 def test_nats_cache_attn_iter():
     torch.manual_seed(0)
@@ -881,8 +1031,6 @@ def test_nats_cache_attn_iter():
     n_tokens_in_nats_block1 = cache1._n_tokens_in_nats_block
     n_tokens_in_nats_block2 = cache2._n_tokens_in_nats_block
 
-    import pdb
-    pdb.set_trace()
 
     assert (cache_k1 - cache_k2).abs().sum() == 0
     if valid_attn_tokens1 is not None:
@@ -895,12 +1043,8 @@ def test_nats_cache_attn_iter():
             assert valid_attn_tokens1[:, valid_attn_tokens2.shape[1]:].int().sum() == 0
 
     assert (n_attn_blocks1 == n_attn_blocks2).all()
-    import pdb
-    pdb.set_trace()
-    assert (n_tokens_in_nats_block1 == n_tokens_in_nats_block2)
 
-    import pdb
-    pdb.set_trace()
+    assert (n_tokens_in_nats_block1 == n_tokens_in_nats_block2)
 
 
 if __name__ == "__main__":

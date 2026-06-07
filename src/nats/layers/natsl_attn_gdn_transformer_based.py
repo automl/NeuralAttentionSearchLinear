@@ -76,7 +76,7 @@ class NeuralAttentionSearchLinearAttentionBased(nn.Module):
         mode: str = 'chunk',
         allow_neg_eigval: bool = False,
         lattns_use_silu: bool=False,
-        outputs_are_wighted: bool = False,
+        outputs_are_weighted: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool = False,
         compute_dnats_for_invalid_blocks_linear_att: bool = False,
         incomplete_block_start_with_ht: bool = True,
@@ -149,8 +149,8 @@ class NeuralAttentionSearchLinearAttentionBased(nn.Module):
             self.nats_sample_func = partial(hard_softmax, dim=-1)
         self.nats_layer = nn.Linear(hidden_size, (self.n_ops * self.num_nats_head), bias=False)
 
-        self.outputs_are_wighted = outputs_are_wighted
-        if self.outputs_are_wighted:
+        self.outputs_are_weighted = outputs_are_weighted
+        if self.outputs_are_weighted:
             self.nats_out_weights_layer = nn.Linear(hidden_size, self.n_ops * self.num_nats_head, bias=False)
 
         A = torch.empty(self.num_lattn_heads, dtype=torch.float32).uniform_(0, 16)
@@ -202,21 +202,44 @@ class NeuralAttentionSearchLinearAttentionBased(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
         batch_size, q_len, dim = hidden_states.shape
+        if attention_mask is not None and batch_size > 1:
+            raise NotImplementedError("Currently, nats with variable length wihtin batch is not supported!")
+        
         mode = 'fused_recurrent' if q_len <= 64 else self.mode
+        nats_cache: NAtSLayerCache | None = None
+        if past_key_values is not None:
+            if len(past_key_values) > self.layer_idx:
+                nats_cache = past_key_values[self.layer_idx]
+            else:
+                past_key_values.add_natsl_layer_cache(
+                    0, n_tokens_in_nats_block=0, n_attn_blocks=None,
+                    nats_block_size=self.nats_block_size, op_for_incomplete_chunk=self.ops_for_incomplete_chunks,
+                )
+        if past_key_values is not None and len(past_key_values) > self.layer_idx:
+            nats_cache = past_key_values[self.layer_idx]
 
-        hs_reduced = self.pooling_func(
-            hidden_states.view(batch_size, q_len, 1, dim),
-            chunk_size=self.nats_block_size,
-            cu_seqlens=None
-        )
-        hs_reduced = hs_reduced.view(batch_size, hs_reduced.shape[1], dim)
-        nats_op_types = self.nats_layer(hs_reduced)
-        nats_op_logits = rearrange(nats_op_types, '... (h d) -> ... h d', d=self.n_ops)
-        nats_op_types = self.nats_sample_func(nats_op_logits)
-        # The last block is set 1 for all the operations. This does not influence the output values
-        nats_op_types[:, -1] = 1
-        n_nats_blocks = nats_op_types.int().sum(1)
-        self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
+        if nats_cache is not None:
+            nats_layer_input = nats_cache.update_attn_types(input_hidden_states=hidden_states)
+        else:
+            nats_layer_input = hidden_states
+            self.nats_layer_input = nats_layer_input
+
+        if nats_layer_input is not None:
+            hs_reduced = self.pooling_func(
+                nats_layer_input.unsqueeze(-2),
+                chunk_size=self.nats_block_size,
+                cu_seqlens=cu_seqlens
+            )
+            hs_reduced = hs_reduced.view(batch_size, hs_reduced.shape[1], dim)
+            nats_op_types = self.nats_layer(hs_reduced)
+            nats_op_logits = rearrange(nats_op_types,  '... (h d) -> ... h d', d=self.n_ops)
+            nats_op_types = self.nats_sample_func(nats_op_logits)
+            # The last block is set 1 for all the operations. This does not influence the output values since the last block only 
+            # contains intra-chunk correlations. 
+        else:
+            nats_op_types = torch.ones(batch_size, 1, self.num_nats_head, self.n_ops,
+                                       device=hidden_states.device,dtype=hidden_states.dtype)
+
 
         batch_size, q_len, _ = hidden_states.size()
 
@@ -262,18 +285,17 @@ class NeuralAttentionSearchLinearAttentionBased(nn.Module):
                 max_seqlen = max(max_seqlen, self.max_position_embeddings)
             q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
-        if past_key_values is not None:
-            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
-            k_cached, v_cached = past_key_values.update(
-                attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
-                layer_idx=self.layer_idx,
-                offset=q_len,
-                cache_kwargs=dict(window_size=self.window_size)
-            )['attn_state']
-            if cache_has_content:
-                k, v = k_cached, v_cached
-                k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
-                v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
+        if nats_cache is not None:
+            nats_op_types_raw = nats_op_types.clone()
+            k_attn, v_attn = nats_cache.update_attn_cache((k_attn, v_attn), nats_block_types=nats_op_types_raw,)
+            k, v, beta, g = nats_cache.update_lattn_cache((k,v), beta, g, mode, self.ops_for_incomplete_chunks)
+            recurrent_state_gdn_block_start = nats_cache.recurrent_state_block_start
+            recurrent_state_gated_delta = nats_cache.recurrent_state
+            g_cumsum = nats_cache.g_cumsum
+        else:
+            recurrent_state_gated_delta = None
+            recurrent_state_gdn_block_start = None
+            g_cumsum = 0
 
         beta = self.b_proj(hidden_states).sigmoid()
         if self.allow_neg_eigval:
@@ -281,41 +303,114 @@ class NeuralAttentionSearchLinearAttentionBased(nn.Module):
 
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
-        if mode == 'chunk':
-            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn(
-                q_attn=q, k_attn=k, v_attn=v,
-                q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
-                initial_state_gated_delta=None, # TODO this needs ot be adjusted
+        if mode == 'chunk' and self.training:
+            # TODO start with partial gated delta sates?
+            nats_op_types[:, -1] = 1
+            n_nats_blocks = nats_op_types.int().sum(1)
+            self.attn_fraction = (n_nats_blocks.float()[..., 0] / nats_op_types.shape[1]).mean(0).detach()
+            o_gated_delta, o_attn, recurrent_state_gated_delta = nats_mixed_attn_gdn(
+                q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                q_lattn=q, k_lattn=k, v_lattn=v,
+                initial_state_gated_delta=recurrent_state_gated_delta,
                 g=g, beta=beta,
                 nats_block_types=nats_op_types,
                 n_nats_blocks=n_nats_blocks,
-                scale_attn=k.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
-                cu_seqlens=None, cu_seqlens_nats=None,
+                scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
                 nats_block_size=self.nats_block_size,
                 ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
                 output_final_state_gated_delta=use_cache,
                 compute_dnats_for_invalid_blocks_attn=self.compute_dnats_for_invalid_blocks_attn,
                 compute_dnats_for_invalid_blocks_linear_att=self.compute_dnats_for_invalid_blocks_linear_att,
                 incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
                 use_g_for_attn=self.usg_for_attn,
                 lattn_use_qk_l2norm_in_kernel=True,
             )
-            if self.outputs_are_wighted:
-                o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
-                o = o_gated_delta * o_weights[..., [1]] + o_attn.view(o_gated_delta.shape) * o_weights[..., [0]]
+            recurrent_state_gdn_block_start = None
+        elif mode == 'chunk' and self.eval():
+            t_k = k.shape[1]
+            if t_k % self.nats_block_size == 0:
+                op_type_last_chunk = nats_op_types[:, -1].clone()
             else:
-                o = o_gated_delta + o_attn.view(o_gated_delta.shape)
+                op_type_last_chunk = None
+            nats_op_types[:, -1] = 1
+            n_nats_blocks = nats_op_types.int().sum(1)
+            o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_chunk_inference(
+                q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                q_lattn=q, k_lattn=k, v_lattn=v,
+                initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
+                g=g, beta=beta,
+                nats_block_types=nats_op_types,
+                op_type_last_chunk=op_type_last_chunk,
+                n_nats_blocks=n_nats_blocks,
+                scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
+                nats_block_size=self.nats_block_size,
+                ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
+                output_final_state_gated_delta=use_cache,
+                incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
+                use_g_for_attn=self.usg_for_attn,
+                lattn_use_qk_l2norm_in_kernel=True,
+            )
         elif mode == 'fused_recurrent':
-            raise NotImplementedError
+            # we first start with the attn output
+            attn_msk = nats_cache.generate_msk(n_data= q_len, nats_block_types=nats_op_types,
+                                               compute_incomplete_chunk=self.ops_for_incomplete_chunks != 'gated_delta_net')
+            # recurrent_state_gated_delta_ = recurrent_state_gated_delta.clone()
+
+            o_gated_delta, o_attn, recurrent_state_gated_delta, recurrent_state_gdn_block_start = nats_mixed_attn_gdn_recurrent(
+                q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
+                q_lattn=q, k_lattn=k, v_lattn=v,
+                attn_msk=attn_msk,
+                initial_state_gated_delta=recurrent_state_gated_delta,
+                initial_state_gated_delta_chunk_start=recurrent_state_gdn_block_start,
+                g=g, g_cumsum=g_cumsum, beta=beta,
+                nats_block_types=nats_op_types,
+                n_tokens_in_current_block=nats_cache._n_tokens_in_nats_block if nats_cache is not None else 0,
+                scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k.shape[-1] ** -0.5,
+                cu_seqlens=cu_seqlens, cu_seqlens_nats=None,
+                nats_block_size=self.nats_block_size,
+                ops_for_incomplete_chunks=self.ops_for_incomplete_chunks,
+                output_final_state_gated_delta=use_cache,
+                incomplete_block_start_with_ht=self.incomplete_block_start_with_ht,
+                decay_for_non_gdn_blocks=self.decay_for_non_gdn_blocks,
+                use_g_for_attn=self.usg_for_attn,
+                lattn_use_qk_l2norm_in_kernel=True,
+            )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
-        o = o.reshape(batch_size, q_len, -1)
+        
+        if nats_cache is not None:
+            nats_cache.update(
+                recurrent_state=recurrent_state_gated_delta,
+                recurrent_state_block_start=recurrent_state_gdn_block_start,
+                attn_state=(k_attn, v_attn),
+                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+                nats_block_types=nats_op_types_raw,
+                l_attn_state=(k, v),
+                g=g,
+                n_new_tokens=q_len
+            )
+
+        if self.use_gate:
+            g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
+            if self.outputs_are_weighted:
+                #o_weights = self.nats_out_weights_layer(hidden_states).unflatten(-1, (self.num_nats_head, self.n_ops))
+                #o = self.o_norm(o_gated_delta * (o_weights[..., [1]] ), o_attn.view(o_gated_delta.shape) * o_weights[..., [0]], g)
+                o = self.o_norm(o_gated_delta.view(o_attn.shape), o_attn, g, o_weights)
+            else:
+                o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape),g)
+        else:
+            o1 = self.o_norm[0](o_gated_delta)
+            o2 = self.o_norm[1](o_attn)
+            o = o1 + o2.view(o1.shape)
+            #o = self.o_norm(o)
+        o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
 
-        if not output_attentions:
-            attentions = None
-
-        return o, attentions, past_key_values
+        return o, None, past_key_values
 
 
 

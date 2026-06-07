@@ -33,7 +33,7 @@ class NeuralAttentionSearchLineraAttnDeltaConfig(PretrainedConfig):
             hidden_ratio: Optional[int] = 4,
             intermediate_size: Optional[int] = None,
             hidden_act: str = "swish",
-            outputs_are_wighted: bool = True,
+            outputs_are_weighted: bool = True,
             attn_qk_norm: bool = False,
             attn_with_short_conv: bool = False,
             compute_dnats_for_invalid_blocks_attn: bool = False,
@@ -74,7 +74,7 @@ class NeuralAttentionSearchLineraAttnDeltaConfig(PretrainedConfig):
 
         self.n_ops = n_ops
         self.num_nats_head = num_nats_head
-        self.outputs_are_wighted = outputs_are_wighted
+        self.outputs_are_weighted = outputs_are_weighted
         self.attn_qk_norm = attn_qk_norm
         self.nats_block_size = nats_block_size
         self.nats_block_agg_type = nats_block_agg_type

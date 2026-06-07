@@ -524,61 +524,60 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                 b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
                 if USE_G:
                     b_dg += tl.sum(b_ds, 1)
-            if (NAtS_BLOCK_SIZE > BT and COMPUTE_PARTIAL_CHUNKS) or STAGE == 1:
-                # In this case, there is a chance that we need to compute an incomplete nats chunk
-                # For instance, i_T * BT = 16, NATS_BLOCK_SIZE=32, then b_n_iters will be 0, we still need
-                # to check if the [0,...16] are valid
-                load_idx_chunk = b_n_iters * BS // NAtS_BLOCK_SIZE
-                b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
-                i_s0 = b_o_nats_block * NAtS_BLOCK_SIZE
-                if i_s0 < T:  # meaning that the last block is also attention block, we need to do a further computation
-                    i_nats_block = i_s0 // NAtS_BLOCK_SIZE
-                    is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
+        if (NAtS_BLOCK_SIZE > BT and COMPUTE_PARTIAL_CHUNKS) or STAGE == 1:
+            # In this case, there is a chance that we need to compute an incomplete nats chunk
+            # For instance, i_T * BT = 16, NATS_BLOCK_SIZE=32, then b_n_iters will be 0, we still need
+            # to check if the [0,...16] are valid
+            load_idx_chunk = b_n_iters
+            b_o_nats_block = tl.load(nats_block_indices + load_idx_chunk * stride_block_types_t).to(tl.int32)
+            i_s0 = b_o_nats_block * NAtS_BLOCK_SIZE
+            if i_s0 < T:  # meaning that the last block is also attention block, we need to do a further computation
+                i_nats_block = i_s0 // NAtS_BLOCK_SIZE
+                is_attn_block = tl.load(nats_block_types + i_nats_block * stride_block_types_t).to(tl.int1)
 
-                    if STAGE == 1:
-                        b_n_iters_in_nats_block = tl.where(is_attn_block, tl.cdiv(T - b_n_iters * BS, BS), 0)
-                        hi = T
-                    else:
-                        # we start from b_n_iters
-                        b_n_iters_in_nats_block = tl.cdiv(i_t * BT - i_s0, BS)
-                        hi = i_t * BT
+                if STAGE == 1:
+                    b_n_iters_in_nats_block = tl.where(is_attn_block, tl.cdiv(T - b_n_iters * BS, BS), 0)
+                    hi = T
+                else:
+                    # we start from b_n_iters
+                    b_n_iters_in_nats_block = tl.cdiv(i_t * BT - i_s0, BS)
+                    hi = i_t * BT
 
-                    for i_iter_nats in range(0, b_n_iters_in_nats_block):
-                        i_s = i_s0 + i_iter_nats * BS
+                for i_iter_nats in range(0, b_n_iters_in_nats_block):
+                    i_s = i_s0 + i_iter_nats * BS
 
-                        i_s = tl.multiple_of(i_s, BS)
-                        p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (0, 1))
-                        p_v = tl.make_block_ptr(v, (V, T), (1, stride_vt), (i_v * BV, i_s), (BV, BS), (1, 0))
+                    i_s = tl.multiple_of(i_s, BS)
+                    p_k = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s), (BK, BS), (0, 1))
+                    p_v = tl.make_block_ptr(v, (V, T), (1, stride_vt), (i_v * BV, i_s), (BV, BS), (1, 0))
 
-                        # [BK, BS]
-                        b_k = tl.load(p_k, boundary_check=(0, 1))
-                        # [BS, BV]
-                        b_v = tl.load(p_v, boundary_check=(0, 1))
-                        # [BT, BS]
-                        b_s = tl.dot(b_q, b_k) * qk_scale
-                        if USE_G:
-                            b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
-                            b_s += b_gq[:, None] - b_gk[None, :]
+                    # [BK, BS]
+                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    # [BS, BV]
+                    b_v = tl.load(p_v, boundary_check=(0, 1))
+                    # [BT, BS]
+                    b_s = tl.dot(b_q, b_k) * qk_scale
+                    if USE_G:
+                        b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
+                        b_s += b_gq[:, None] - b_gk[None, :]
 
-                        b_p = exp2(b_s - b_lse[:, None])
-                        b_dp = tl.dot(b_do, b_v)
-                        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-                        if COMPUTE_PARTIAL_CHUNKS and (not is_attn_block):
-                            # we also need to compute the non-nats attention blocks if we compute incomplete blocks with
-                            # attention as they will not be considered during dkdv
-                            # TODO we need to test these !!!
-                            b_dv = tl.dot(tl.trans(b_p).to(b_do.dtype), b_do)
-                            b_dk = tl.dot(tl.trans(b_ds).to(b_q.dtype), b_q) * scale
+                    b_p = exp2(b_s - b_lse[:, None])
+                    b_dp = tl.dot(b_do, b_v)
+                    b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+                    if COMPUTE_PARTIAL_CHUNKS and (not is_attn_block):
+                        # we also need to compute the non-nats attention blocks if we compute incomplete blocks with
+                        # attention as they will not be considered during dkdv
+                        b_dv = tl.dot(tl.trans(b_p).to(b_do.dtype), b_do)
+                        b_dk = tl.dot(tl.trans(b_ds).to(b_q.dtype), b_q) * scale
 
-                            p_dk = tl.make_block_ptr(dk, (T, K), (stride_kt, 1), (i_s, 0), (BS, BK), (1, 0))
-                            p_dv = tl.make_block_ptr(dv, (T, V), (stride_vt, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                        p_dk = tl.make_block_ptr(dk, (T, K), (stride_kt, 1), (i_s, 0), (BS, BK), (1, 0))
+                        p_dv = tl.make_block_ptr(dv, (T, V), (stride_vt, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
 
-                            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
-                            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
+                        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
+                        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
 
-                        b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-                        if USE_G:
-                            b_dg += tl.sum(b_ds, 1)
+                    b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+                    if USE_G:
+                        b_dg += tl.sum(b_ds, 1)
 
         if STAGE & 2 and (COMPUTE_PARTIAL_CHUNKS or BT > NAtS_BLOCK_SIZE):
             # if we do not need to compute incomplete chunks, and NAtS_BLOCK_SIZE is larger than BT,
@@ -646,13 +645,61 @@ def parallel_nats_attn_bwd_kernel_dq(q, k, v,  # Q, O are of shape [B, T, H, DQ]
                         b_dv = tl.dot(tl.trans(b_p).to(b_do.dtype), b_do)
                         b_dk = tl.dot(tl.trans(b_ds).to(b_q.dtype), b_q) * scale
 
-                        p_dk = tl.make_block_ptr(dk, (T, K), (stride_qt, 1), (i_s, 0), (BS, BK), (1, 0))
-                        p_dv = tl.make_block_ptr(dv, (T, V), (stride_ot, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-                        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty))
-                        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty))
+                        if NAtS_BLOCK_SIZE > BT:
+                            # Use atomic_add: later BT-chunks of the same non-attention NAtS block
+                            # may also contribute to these same dk/dv positions.
+                            dk_offsets_s2 = tl.arange(0, BS)[:, None] * stride_qt + tl.arange(0, BK)[None, :]
+                            dv_offsets_s2 = tl.arange(0, BS)[:, None] * stride_ot + tl.arange(0, BV)[None, :]
+                            dk_mask_s2 = (i_s + tl.arange(0, BS)[:, None]) < T
+                            tl.atomic_add(dk + i_s * stride_qt + dk_offsets_s2,
+                                        b_dk.to(tl.float32), mask=dk_mask_s2)
+                            tl.atomic_add(dv + i_s * stride_ot + i_v * BV + dv_offsets_s2,
+                                        b_dv.to(tl.float32), mask=dk_mask_s2)
+                        else:
+                            p_dk = tl.make_block_ptr(dk, (T, K), (stride_qt, 1), (i_s, 0), (BS, BK), (1, 0))
+                            p_dv = tl.make_block_ptr(dv, (T, V), (stride_ot, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+                            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty))
+                            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty))
+
                     if USE_G:
                         # TOOD check if we need to consider COMPUTE_INCOMPLETE_CHUNK_SCORES and not seperatedly...
                         b_dg += tl.sum(b_ds, 1)
+
+            # When NAtS_BLOCK_SIZE > BT and the current query block is in a non-attention NAtS block,
+            # queries in this BT-chunk also attend (within-block causal) to keys in earlier BT-chunks
+            # of the same NAtS block. Those contributions are missing from both dq and dk/dv since the
+            # dkdv kernel only processes attention blocks.
+            if NAtS_BLOCK_SIZE > BT and COMPUTE_INCOMPLETE_CHUNK_SCORES:
+                i_nats_q = i_t * BT // NAtS_BLOCK_SIZE
+                is_nats_q_attn = tl.load(nats_block_types + i_nats_q * stride_block_types_t).to(tl.int1)
+                if not is_nats_q_attn:
+                    i_nats_start = i_nats_q * NAtS_BLOCK_SIZE
+                    n_prev_chunks = (i_t * BT - i_nats_start) // BS
+                    for j_prev in range(n_prev_chunks):
+                        i_s_prev = i_nats_start + j_prev * BS
+                        i_s_prev = tl.multiple_of(i_s_prev, BS)
+                        o_k_prev = i_s_prev + tl.arange(0, BS)
+                        m_k_prev = o_k_prev < T
+                        p_k_prev = tl.make_block_ptr(k, (K, T), (1, stride_kt), (0, i_s_prev), (BK, BS), (0, 1))
+                        p_v_prev = tl.make_block_ptr(v, (V, T), (1, stride_vt), (i_v * BV, i_s_prev), (BV, BS), (1, 0))
+                        b_k_prev = tl.load(p_k_prev, boundary_check=(0, 1))
+                        b_v_prev = tl.load(p_v_prev, boundary_check=(0, 1))
+                        b_s_prev = tl.dot(b_q, b_k_prev) * qk_scale
+                        # All queries (i_t*BT+) > all keys (i_nats_start+... < i_t*BT): causal always True
+                        b_p_prev = tl.where(m_k_prev[None, :], exp2(b_s_prev - b_lse[:, None]), 0)
+                        b_dp_prev = tl.dot(b_do, b_v_prev)
+                        b_ds_prev = b_p_prev * (b_dp_prev.to(tl.float32) - b_delta[:, None])
+                        b_dq += tl.dot(b_ds_prev.to(b_k_prev.dtype), tl.trans(b_k_prev))
+                        # Atomic add for dk/dv: race condition with i_t-1 thread writing to same positions
+                        b_dv_prev = tl.dot(tl.trans(b_p_prev).to(b_do.dtype), b_do)
+                        b_dk_prev = tl.dot(tl.trans(b_ds_prev).to(b_q.dtype), b_q) * scale
+                        dk_offsets_prev = tl.arange(0, BS)[:, None] * stride_qt + tl.arange(0, BK)[None, :]
+                        dv_offsets_prev = tl.arange(0, BS)[:, None] * stride_ot + tl.arange(0, BV)[None, :]
+                        dk_mask_prev = o_k_prev[:, None] < T
+                        tl.atomic_add(dk + i_s_prev * stride_qt + dk_offsets_prev,
+                                      b_dk_prev.to(tl.float32), mask=dk_mask_prev)
+                        tl.atomic_add(dv + i_s_prev * stride_ot + i_v * BV + dv_offsets_prev,
+                                      b_dv_prev.to(tl.float32), mask=dk_mask_prev)
 
     b_dq *= scale
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
@@ -925,8 +972,6 @@ def parallel_attn_bwd_kernel_dkdv(q, k, v,  # Q, O are of shape [B, T, H, DQ]
 
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-    # TODO currently we only consider the gradients where the blocks are selected as attns.
-    #  We could also in principle compute
     tl.store(
         dnats + (b_i_nats_block * N_CHUNK_PER_NAtS_BLOCK + i_t_nats_offset) * stride_dblock_attn_t,
         b_dattn.to(dnats.dtype.element_ty)
@@ -1026,7 +1071,6 @@ def parallel_attn_bwd_kernel_dkdv_within_valid_blocks(q, k, v,  # Q, O are of sh
 
     stride_dkt = K * HQ
     stride_dvt = V * HQ
-    # TODO Check if we really need different types for different heads
     stride_block_types_t = N_TYPES * HNAtS
     stride_dblock_attn_t = HQ
     stride_qt = K * HQ
@@ -1503,6 +1547,18 @@ def parallel_attn_bwd_preprocess(
     return delta
 
 
+def parallel_attn_bwd_chunk_size(K: int, NAtS_block_size: int, device_index: int | None = None) -> int:
+    """Return BT used by parallel_attn_bwd_kernel_dkdv (after the BT = min(BT, NAtS_block_size) adjustment).
+    Call this on current_stream to pre-compute chunk_indices_attn_nats before a stream fork."""
+    if check_shared_mem('hopper', device_index):
+        BT = 64  # capped at 64 to avoid register spill (BT=128 → ~288 regs > Hopper's 255 limit)
+    elif check_shared_mem('ampere', device_index):
+        BT = 128 if K <= 64 else 64
+    else:
+        BT = 64
+    return min(BT, NAtS_block_size)
+
+
 def parallel_attn_nats_bwd(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1522,7 +1578,8 @@ def parallel_attn_nats_bwd(
         sliding_window_size: int | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_nats: torch.LongTensor | None = None,
-        is_causal=True
+        is_causal=True,
+        chunk_indices_attn_nats: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
@@ -1562,8 +1619,9 @@ def parallel_attn_nats_bwd(
     delta = parallel_attn_bwd_preprocess(o, do)
 
     dq = torch.empty(B, T, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device)
-    dk = torch.zeros(B, T, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device)
-    dv = torch.zeros(B, T, HQ, V, dtype=v.dtype if H == HQ else torch.float, device=q.device)
+    _dk_dv_needs_f32 = NAtS_block_size > BT and compute_incomplete_chunk_scores
+    dk = torch.zeros(B, T, HQ, K, dtype=torch.float if _dk_dv_needs_f32 else (k.dtype if H == HQ else torch.float), device=q.device)
+    dv = torch.zeros(B, T, HQ, V, dtype=torch.float if _dk_dv_needs_f32 else (v.dtype if H == HQ else torch.float), device=q.device)
     # since we only compute the partial gradients for those selected as attentions, we will not write to all
     # d_nats_block_types. Hence, this needs to be initialized with 0
     dnats = torch.zeros(B, TNAtS * (triton.cdiv(NAtS_block_size, BT)), HQ,
@@ -1612,6 +1670,10 @@ def parallel_attn_nats_bwd(
                                            )
     # n_grids =prepare_nats_block_indices
 
+    # Cap BT for the dkdv kernel on Hopper: BT=128 → ~288 regs/thread > 255 (register spill).
+    # BT=64 → ~156 regs/thread, no spill; grid doubles (more parallelism), same IO and compute.
+    if check_shared_mem('hopper'):
+        BT = min(BT, 64)
     BS = triton.cdiv(BT, NAtS_block_size) * BS  # TODO check if this is really beneficial!!!
     BT = min(BT, NAtS_block_size)  # we need to ensure that each BT block only loads one BT
 
@@ -1648,7 +1710,8 @@ def parallel_attn_nats_bwd(
             num_warps=num_warps,
         )
     else:
-        chunk_indices_attn_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_ATTN], NAtS_block_size, BT)
+        if chunk_indices_attn_nats is None:
+            chunk_indices_attn_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_ATTN], NAtS_block_size, BT)
 
         grid_kv = (NV, len(chunk_indices_attn_nats), GNAtS)
 
@@ -1682,6 +1745,7 @@ def parallel_attn_nats_bwd(
 
     dk = reduce(dk, 'b t (h g) k -> b t h k', g=G, reduction='sum')
     dv = reduce(dv, 'b t (h g) v -> b t h v', g=G, reduction='sum')
+    
     if NAtS_block_size > BT:
         dnats = reduce(
             dnats, 'b (t gt) (h g) -> b t h',
@@ -1881,7 +1945,7 @@ def test_mixed_attns():
     D_HEAD = 64
     GATTN = 1
     N_OPTs = 3
-    NATS_Chunk = 64
+    NATS_Chunk = 128
     TNAtS = triton.cdiv(T, NATS_Chunk)
     BLOCK_M = 32
     device = torch.device("cuda")
@@ -1928,8 +1992,8 @@ def test_mixed_attns():
                                    )
     target = torch.rand_like(out1)
     loss = ((out1 - target) ** 2).sum()
-    #loss = (out1 ** 2).sum()
-    #loss.backward()
+    loss = (out1 ** 2).sum()
+    loss.backward()
 
     q1 = copy.deepcopy(q.detach()).view(BATCH, T, HQ * GATTN, D_HEAD // GATTN).transpose(1, 2)
     k1 = copy.deepcopy(k.detach()).view(BATCH, T, H * GATTN, D_HEAD // GATTN).transpose(1, 2)
@@ -1997,8 +2061,8 @@ def test_mixed_attns():
     v2 = repeat_kv(v1, HQ // H)
     out2 = torch.nn.functional.scaled_dot_product_attention(q1, k2, v2, mask_.bool())
     loss2 = ((target-out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)) ** 2).sum()
-    #loss2 = (out2**2).sum()
-    #loss2.backward()
+    loss2 = (out2**2).sum()
+    loss2.backward()
 
     out2 = out2.transpose(1, 2).view(BATCH, T, HQ, D_HEAD)
 

@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import torch
+from flash_attn import flash_attn_varlen_func, flash_attn_func
 from torch.nn import functional as F
+from einops import rearrange
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous, input_guard
@@ -8,13 +10,15 @@ from fla.ops.utils.cumsum import chunk_global_cumsum
 
 from nats.ops.attns.attns import parallel_attn_nats_fwd, parallel_attn_nats_bwd, parallel_attn_bwd_chunk_size
 from nats.ops.attns.attn_utils import repeat_masks
-from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
-from nats.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_nats_inference_fwd
-from nats.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule
+#from nats.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_nats_fwd, chunk_gated_delta_rule_nats_bwd
+from nats.ops.mamba.chunk import chunk_mamba2_fwd, chunk_mamba2_bwd
+from nats.ops.mamba.chunk_fwd import chunk_mamba_inference_fwd
+from nats.ops.mamba.fused_recurrent import fused_recurrent_mamba_nats_fwd
 
 from nats.ops.nats_util import prepare_nats_block_indices, prepare_nats_chunk_offsets, compute_starting_idx_for_chunks
+
 CHUNK_SIZE = 64
-all_nats_ops = ['gated_delta', 'gated_delta_net']
+all_nats_ops = ['gated_delta', 'gated_delta_net', 'mamba']
 
 _attn_streams: dict[int, torch.cuda.Stream] = {}
 
@@ -29,47 +33,46 @@ def _get_attn_stream(device: torch.device) -> torch.cuda.Stream:
 @dataclass
 class RunIncompleteBlock:
     attn: bool = False
-    gated_delta_net: bool = False
+    mamba: bool = False
 
 
 all_incomplete_ops: dict[str, RunIncompleteBlock] = {
     'all': RunIncompleteBlock(attn=True,
-                              gated_delta_net=True),
+                              mamba=True),
     'attn': RunIncompleteBlock(attn=True,
-                               gated_delta_net=False),
-    'gated_delta_net': RunIncompleteBlock(attn=False,
-                                          gated_delta_net=True)
+                               mamba=False),
+    'mamba': RunIncompleteBlock(attn=False,
+                                mamba=True)
 }
 
 
 
 
-class NAtSMixedAttentionGDN(torch.autograd.Function):
+class NAtSMixedAttentionMamba(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_fwd
     def forward(ctx,
                 q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
                 q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
-                initial_state_gated_delta: torch.Tensor,
+                initial_state_mamba: torch.Tensor,
                 g: torch.Tensor,
-                beta: torch.Tensor,
                 nats_block_types: torch.Tensor,
                 n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
                 scale_attn, scale_lattn, cu_seqlens, cu_seqlens_nats,
                 nats_block_size: int,
                 attn_sw_size: int | None = None,
-                ops_for_incomplete_chunks: str = 'gated_delta_net',
-                output_final_state_gated_delta: bool = False,
+                ops_for_incomplete_chunks: str = 'all',
+                output_final_state_mamba: bool = False,
                 compute_dnats_for_invalid_blocks_attn: bool = False,
                 compute_dnats_for_invalid_blocks_linear_att: bool = True,
-                decay_for_non_gdn_blocks: bool=False,
+                decay_for_non_mamba_blocks: bool=False,
                 incomplete_block_start_with_ht: bool = True,
                 use_g_for_attn: bool = True,
-                lattn_use_qk_l2norm_in_kernel: bool = True,
                 ):
         incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
         """
+        # TODO check how to check if this function is forwarded under no_grad env!
         if not incomplete_block_strategy.gated_delta_net:
             if torch.is_grad_enabled():
                 keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
@@ -78,15 +81,12 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         else:
             keep_wu_as_kv = True
         """
-        if not incomplete_block_strategy.gated_delta_net:
-            keep_wu_as_kv = compute_dnats_for_invalid_blocks_linear_att
-        else:
-            keep_wu_as_kv = True
 
-        incomplete_block_start_with_ht = incomplete_block_strategy.gated_delta_net and incomplete_block_start_with_ht
+        incomplete_block_start_with_ht = incomplete_block_strategy.mamba and incomplete_block_start_with_ht
 
-        nats_block_types = torch.round(nats_block_types) 
+        nats_block_types = torch.round(nats_block_types) # TODO  we need to investigate this further...
 
+        # TODO this is only for head first is True,
         assert nats_block_size >= CHUNK_SIZE
         TNAtS = nats_block_types.shape[1]
         T = q_lattn.shape[1]
@@ -104,68 +104,70 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         else:
             g_cumsum_attn = None
 
+        # TODO make this a dict? check if it can pass torch compile's check
         OFFSET_ATTN = 0
-        OFFSET_GATED_DELTA_NET = 1
+        OFFSET_MAMBA = 1
 
-        # attns
-        o_attn, lse_attn, _ = parallel_attn_nats_fwd(
-            q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
-            g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
-            sliding_window_size=attn_sw_size,
-            offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
-            is_causal=True, store_msk=False,
-        )
+        # Launch attn on secondary stream; linear-attn runs on current stream in parallel.
+        # _attn_live pins all pre-fork tensors passed as raw pointers to the attn kernel,
+        # preventing the allocator from recycling them before attn_stream finishes.
+        _attn_live = (q_attn, k_attn, v_attn, nats_block_types, nats_block_indices, g_cumsum_attn)
+        attn_stream = _get_attn_stream(q_attn.device)
+        attn_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(attn_stream):
+            o_attn, lse_attn, _ = parallel_attn_nats_fwd(
+                q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
+                g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
+                sliding_window_size=attn_sw_size,
+                offset_attn=0, compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
+                is_causal=True, store_msk=False,
+            )
 
-        if lattn_use_qk_l2norm_in_kernel:
-            q_lattn, q_rstd_lattn = l2norm_fwd(q_lattn)
-            k_lattn, k_rstd_lattn = l2norm_fwd(k_lattn)
-        else:
-            q_rstd_lattn, k_rstd_lattn = None, None
-
-
-        chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_GATED_DELTA_NET],
+        chunk_indices_mamba_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_MAMBA],
                                                               nats_block_size,
                                                               CHUNK_SIZE, )
-        nats_block_delta_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
+        nats_block_mamba_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
                                                               nats_block_types,
                                                               nats_block_size,
-                                                              CHUNK_SIZE, OFFSET_GATED_DELTA_NET)
-        starting_h_idx_gated_delta = compute_starting_idx_for_chunks(
+                                                              CHUNK_SIZE, OFFSET_MAMBA)
+        starting_h_idx_mamba = compute_starting_idx_for_chunks(
             nats_block_indices=nats_block_indices,
             T=T,
             BT=CHUNK_SIZE,
             NAtS_Block_Size=nats_block_size,
-            offset_op=OFFSET_GATED_DELTA_NET
+            offset_op=OFFSET_MAMBA
         )
-
-        g_gated_delta, o_gated_delta, A_gated_delta, final_state_gated_delta = chunk_gated_delta_rule_nats_fwd(
-            q=q_lattn,
-            k=k_lattn,
-            v=v_lattn,
+        o_mamba, g_mamba, final_state_mamba = chunk_mamba2_fwd(
+            X=v_lattn,
+            B=k_lattn,
+            C=q_lattn,
             g=g,
-            beta=beta,
             nats_block_types=nats_block_types,
             nats_block_indices=nats_block_indices,
             n_nats_blocks=n_nats_blocks,
             scale=scale_lattn,
-            initial_state=initial_state_gated_delta,
-            output_final_state=output_final_state_gated_delta,
-            chunk_indices_delta_nats=chunk_indices_delta_nats,
-            nats_block_delta_offsets=nats_block_delta_offsets,
-            starting_h_idx_delta=starting_h_idx_gated_delta,
+            initial_state=initial_state_mamba,
+            output_final_state=output_final_state_mamba,
+            chunk_indices_mamba_nats=chunk_indices_mamba_nats,
+            nats_block_mamba_offsets=nats_block_mamba_offsets,
+            starting_h_idx_mamba=starting_h_idx_mamba,
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
             nats_block_size=nats_block_size,
-            offset_delta=OFFSET_GATED_DELTA_NET,
-            compute_incomplete_chunk_scores=incomplete_block_strategy.gated_delta_net,
+            offset_mamba=OFFSET_MAMBA,
+            compute_incomplete_chunk_scores=incomplete_block_strategy.mamba,
             incomplete_block_start_with_ht=incomplete_block_start_with_ht,
-            decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
-            keep_wu_as_kv=keep_wu_as_kv,
+            decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
         )
+
+        # Sync: ensure attn kernel has completed before saving its outputs
+        torch.cuda.current_stream().wait_stream(attn_stream)
+        del _attn_live
+
         ctx.save_for_backward(
             q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
-            q_lattn, q_rstd_lattn, k_lattn, k_rstd_lattn, v_lattn, g_gated_delta, beta, A_gated_delta,
-            initial_state_gated_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
+            q_lattn, k_lattn, v_lattn, g_mamba, 
+            initial_state_mamba, chunk_indices_mamba_nats, nats_block_mamba_offsets, starting_h_idx_mamba,
             cu_seqlens, cu_seqlens_nats,
             nats_block_types, nats_block_indices, n_nats_blocks,
         )
@@ -175,37 +177,36 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
 
         ctx.nats_block_size = nats_block_size
         ctx.attn_sw_size = attn_sw_size
-        ctx.lattn_use_qk_l2norm_in_kernel = lattn_use_qk_l2norm_in_kernel
 
         ctx.OFFSET_ATTN = OFFSET_ATTN
-        ctx.OFFSET_GATED_DELTA = OFFSET_GATED_DELTA_NET
+        ctx.OFFSET_MAMBA = OFFSET_MAMBA
+        ctx.output_final_state = output_final_state_mamba
 
         ctx.ops_for_incomplete_chunks = ops_for_incomplete_chunks
         ctx.compute_dnats_for_invalid_blocks_attn = compute_dnats_for_invalid_blocks_attn
         ctx.compute_dnats_for_invalid_blocks_linear_att = compute_dnats_for_invalid_blocks_linear_att
         ctx.incomplete_block_start_with_ht = incomplete_block_start_with_ht
-        ctx.keep_wu_as_kv = keep_wu_as_kv
         ctx.incomplete_block_strategy = incomplete_block_strategy
-        ctx.decay_for_non_gdn_blocks = decay_for_non_gdn_blocks
+        ctx.decay_for_non_mamba_blocks = decay_for_non_mamba_blocks
 
-        return o_gated_delta, o_attn, final_state_gated_delta
+        return o_mamba, o_attn, final_state_mamba
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
     def backward(
             ctx,
-            do_gated_delta: torch.Tensor,
+            do_mamba: torch.Tensor,
             do_attn: torch.Tensor,
-            dht_gated_net: torch.Tensor
+            dht_mamba: torch.Tensor
     ):
 
         (
-            q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
-            q_lattn, q_rstd_lattn, k_lattn, k_rstd_lattn, v_lattn, g_gated_delta, beta, A_gated_delta,
-            initial_state_gated_delta, chunk_indices_delta_nats, nats_block_delta_offsets, starting_h_idx_gated_delta,
-            cu_seqlens, cu_seqlens_nats,
-            nats_block_types, nats_block_indices, n_nats_blocks,
+           q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
+           q_lattn, k_lattn, v_lattn, dA_cumsum, 
+           initial_state_mamba, chunk_indices_mamba_nats, nats_block_mamba_offsets, starting_h_idx_mamba,
+           cu_seqlens, cu_seqlens_nats,
+           nats_block_types, nats_block_indices, n_nats_blocks,
         ) = ctx.saved_tensors
 
         # Pre-compute attn chunk indices on current_stream (before fork) to eliminate
@@ -221,117 +222,150 @@ class NAtSMixedAttentionGDN(torch.autograd.Function):
         else:
             chunk_indices_attn_nats = None
 
-        # attns
-        dq_attn, dk_attn, dv_attn, dg_attn, dnats_attn = parallel_attn_nats_bwd(
-            q_attn, k_attn, v_attn, o_attn, nats_block_types=nats_block_types,
-            nats_block_indices=nats_block_indices,
-            n_nats_blocks=n_nats_blocks,
-            g_cumsum=g_cumsum_attn,
-            lse=lse_attn,
-            do=do_attn,
-            scale=ctx.scale_attn,
-            NAtS_block_size=ctx.nats_block_size,
-            sliding_window_size=ctx.attn_sw_size,
-            OFFSET_ATTN=ctx.OFFSET_ATTN,
-            compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
-            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn if ctx.attn_sw_size is not None else False,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_nats=cu_seqlens_nats,
-            is_causal=True,
-            chunk_indices_attn_nats=chunk_indices_attn_nats,
-        )
+        # Launch attn bwd on secondary stream; gated-delta bwd runs on current stream in parallel.
+        _attn_live = (q_attn, k_attn, v_attn, o_attn, g_cumsum_attn, lse_attn,
+                      nats_block_types, nats_block_indices, n_nats_blocks, chunk_indices_attn_nats)
+        attn_stream = _get_attn_stream(q_attn.device)
+        attn_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(attn_stream):
+            dq_attn, dk_attn, dv_attn, dg_attn, dnats_attn = parallel_attn_nats_bwd(
+                q_attn, k_attn, v_attn, o_attn, nats_block_types=nats_block_types,
+                nats_block_indices=nats_block_indices,
+                n_nats_blocks=n_nats_blocks,
+                g_cumsum=g_cumsum_attn,
+                lse=lse_attn,
+                do=do_attn,
+                scale=ctx.scale_attn,
+                NAtS_block_size=ctx.nats_block_size,
+                sliding_window_size=ctx.attn_sw_size,
+                OFFSET_ATTN=ctx.OFFSET_ATTN,
+                compute_dnats_for_invalid_blocks_attn=ctx.compute_dnats_for_invalid_blocks_attn,
+                compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.attn if ctx.attn_sw_size is not None else False,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_nats=cu_seqlens_nats,
+                is_causal=True,
+                chunk_indices_attn_nats=chunk_indices_attn_nats,
+            )
 
-        dq_gated_delta, dk_gated_delta, dv_gated_delta, db, dg_gated_delta, dh0_gated_delta, dnats_gated_delta \
-            = chunk_gated_delta_rule_nats_bwd(
-            q=q_lattn,
-            k=k_lattn,
-            v=v_lattn,
-            g=g_gated_delta,
-            beta=beta,
-            A=A_gated_delta,
+        # Gated-delta bwd on current stream (overlaps with attn dq + dkdv kernels above)
+        dq_mamba, dk_mamba, dv_mamba, dg, dh0_mamba, dnats_mamba \
+            = chunk_mamba2_bwd(
+            X=v_lattn,
+            B=k_lattn,
+            C=q_lattn,
+            dA_cumsum=dA_cumsum,
             nats_block_types=nats_block_types,
             nats_block_indices=nats_block_indices,
             n_nats_blocks=n_nats_blocks,
             scale=ctx.scale_lattn,
-            initial_state=initial_state_gated_delta,
-            do=do_gated_delta,
-            dht=dht_gated_net,
-            chunk_indices_delta_nats=chunk_indices_delta_nats,
-            nats_block_delta_offsets=nats_block_delta_offsets,
-            starting_h_idx_delta=starting_h_idx_gated_delta,
+            initial_state=initial_state_mamba,
+            do=do_mamba,
+            dht=dht_mamba,
+            chunk_indices_mamba_nats=chunk_indices_mamba_nats,
+            nats_block_mamba_offsets=nats_block_mamba_offsets,
+            starting_h_idx_mamba=starting_h_idx_mamba,
             cu_seqlens=cu_seqlens,
             cu_seqlens_nats=cu_seqlens_nats,
             nats_block_size=ctx.nats_block_size,
-            offset_delta=ctx.OFFSET_GATED_DELTA,
-            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.gated_delta_net,
+            offset_mamba=ctx.OFFSET_MAMBA,
+            compute_incomplete_chunk_scores=ctx.incomplete_block_strategy.mamba,
             compute_dnats_for_invalid_blocks=ctx.compute_dnats_for_invalid_blocks_linear_att,
             incomplete_block_start_with_ht=ctx.incomplete_block_start_with_ht,
-            keep_wu_as_kv=ctx.keep_wu_as_kv,
-            decay_for_non_gdn_blocks=ctx.decay_for_non_gdn_blocks,
+            decay_for_non_mamba_blocks=ctx.decay_for_non_mamba_blocks,
         )
 
-        if ctx.lattn_use_qk_l2norm_in_kernel:
-            dq_gated_delta = l2norm_bwd(q_lattn, q_rstd_lattn, dq_gated_delta)
-            dk_gated_delta = l2norm_bwd(k_lattn, k_rstd_lattn, dk_gated_delta)
+        # Sync: wait for attn bwd to complete before using its outputs
+        torch.cuda.current_stream().wait_stream(attn_stream)
+        del _attn_live
 
-        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_gated_delta.unsqueeze(-1)], dim=-1)
+        # TODO if we want a uniform dv, we might need some adjustments here!!!
+        #  check how to solve problems for dg for transformer
+        # this should be adjusted based on our choice, we need to check how to solve this
+        dnats = torch.cat([dnats_attn.unsqueeze(-1), dnats_mamba.unsqueeze(-1)], dim=-1)
+        # TODO if we have other linear attn types, we need to adjust them here!
+
         return dq_attn, dk_attn, dv_attn, \
-               dq_gated_delta, dk_gated_delta, dv_gated_delta, \
-               dh0_gated_delta, \
-               dg_gated_delta, db, dnats, None, \
+               dq_mamba, dk_mamba, dv_mamba, \
+               dh0_mamba, \
+               dg, dnats, \
                None, None, None, None, \
                None, None, None, None, None, None, None, None, None, None
 
 
-def nats_mixed_attn_gdn(
+def nats_mixed_attn_mamba(
         q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
         q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
-        initial_state_gated_delta: torch.Tensor,
+        initial_state_mamba: torch.Tensor,
         g: torch.Tensor,
-        beta: torch.Tensor,
         nats_block_types: torch.Tensor,
         n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
         scale_attn=None, scale_lattn=None,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size: int = 64,
         attn_sw_size: int | None = None,
-        ops_for_incomplete_chunks: str = 'gated_delta_net',
-        output_final_state_gated_delta: bool = False,
+        ops_for_incomplete_chunks: str = 'all',
+        output_final_state_mamba: bool = False,
         compute_dnats_for_invalid_blocks_attn: bool = False,  # TODO this is not activated yet, we need to fix that!
         compute_dnats_for_invalid_blocks_linear_att: bool = True,
-        decay_for_non_gdn_blocks:bool=False,
+        decay_for_non_mamba_blocks:bool=False,
         incomplete_block_start_with_ht: bool = True,
         use_g_for_attn: bool = False,
-        lattn_use_qk_l2norm_in_kernel: bool = True,
 ):
     if scale_attn is None:
         scale_attn = k_attn.shape[-1] ** -0.5
     if scale_lattn is None:
-        scale_lattn = k_lattn.shape[-1] ** -0.5
+        scale_lattn = 1
 
-    o_gated_delta_net, o_attn, gated_delta_ht = NAtSMixedAttentionGDN.apply(
+    o_mamba, o_attn, mamba_ht = NAtSMixedAttentionMamba.apply(
         q_attn, k_attn, v_attn, q_lattn, k_lattn, v_lattn,
-        initial_state_gated_delta, g, beta,
+        initial_state_mamba, g,
         nats_block_types, n_nats_blocks, scale_attn,
         scale_lattn, cu_seqlens, cu_seqlens_nats,
         nats_block_size, attn_sw_size, ops_for_incomplete_chunks,
-        output_final_state_gated_delta,
+        output_final_state_mamba,
         compute_dnats_for_invalid_blocks_attn,
         compute_dnats_for_invalid_blocks_linear_att,
-        decay_for_non_gdn_blocks,
+        decay_for_non_mamba_blocks,
         incomplete_block_start_with_ht,
-        use_g_for_attn, lattn_use_qk_l2norm_in_kernel
+        use_g_for_attn
     )
-    return o_gated_delta_net, o_attn, gated_delta_ht
+    return o_mamba, o_attn, mamba_ht
 
 
-def nats_mixed_attn_gdn_chunk_inference(
+@torch.compile
+def one_step_attn(q_attn:torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor, attn_msk: torch.Tensor, scale_attn:float):
+    mask_flatten = attn_msk.flatten()
+    q_states_flatten = rearrange(q_attn, 'b t (h g) d -> (b h t) g  d', h=attn_msk.shape[1])
+    k_states_flatten = rearrange(k_attn, 'b t (h g) d -> (b h t) g  d', h=attn_msk.shape[1])[mask_flatten]
+    v_states_flatten = rearrange(v_attn, 'b t (h g) d -> (b h t) g  d', h=attn_msk.shape[1])[mask_flatten]
+    n_pad = v_states_flatten.shape[-1] - q_states_flatten.shape[-1]
+    q_states_flatten = F.pad(q_states_flatten, (0, n_pad))
+    k_states_flatten = F.pad(k_states_flatten, (0, n_pad))
+    cu_seqlens_q = torch.arange(1 + len(q_states_flatten), dtype=torch.int32,
+            device=q_states_flatten.device)
+    n_valid_tokens = attn_msk.sum(-1).flatten()
+
+    cu_seqlens_k = F.pad(torch.cumsum(n_valid_tokens.flatten(), -1, dtype=torch.int32), (1, 0))
+    attn_output = flash_attn_varlen_func(
+            q_states_flatten,
+            k_states_flatten,
+            v_states_flatten,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            max_seqlen_k=torch.max(n_valid_tokens),
+            softmax_scale=scale_attn,
+            )
+    o_attn = rearrange(attn_output, '(b h t) g d -> b t (h g) d', h=attn_msk.shape[1], t=1)
+    return o_attn
+
+
+def nats_mixed_attn_mamba_chunk_inference(
         q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
         q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
-        initial_state_gated_delta_chunk_start: torch.Tensor, # TODO this should also be hte part
+        initial_state_mamba_start: torch.Tensor, # TODO this should also be hte part
         g: torch.Tensor,
         #g_cumsum: torch.Tensor, # TODO do we need this?
-        beta: torch.Tensor,
         nats_block_types: torch.Tensor,
         op_type_last_chunk: torch.Tensor | None,
         n_nats_blocks: torch.Tensor,  # n_nats_blocks is acquired by attn_types.int().sum(1)
@@ -339,24 +373,17 @@ def nats_mixed_attn_gdn_chunk_inference(
         scale_attn=None, scale_lattn=None,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size: int = 64,
-        attn_sw_size: int | None = None,
-        ops_for_incomplete_chunks: str = 'gated_delta_net',
-        output_final_state_gated_delta: bool = False,
-        decay_for_non_gdn_blocks:bool=False,
+        ops_for_incomplete_chunks: str = 'all',
+        output_final_state_mamba: bool = True,
+        decay_for_non_mamba_blocks:bool=True,
         incomplete_block_start_with_ht: bool = True,
         use_g_for_attn: bool = False,
-        lattn_use_qk_l2norm_in_kernel: bool = True,
 ):
     incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
     if scale_attn is None:
         scale_attn = k_attn.shape[-1] ** -0.5
     if scale_lattn is None:
         scale_lattn = k_lattn.shape[-1] ** -0.5
-
-    if incomplete_block_strategy.gated_delta_net:
-        keep_wu_as_kv = True
-    else:
-        keep_wu_as_kv = False
 
     TNAtS = nats_block_types.shape[1]
     T = q_lattn.shape[1]
@@ -376,91 +403,78 @@ def nats_mixed_attn_gdn_chunk_inference(
 
     # TODO make this a dict? check if it can pass torch compile's check
     OFFSET_ATTN = 0
-    OFFSET_GATED_DELTA_NET = 1
+    OFFSET_MAMBA = 1
 
     # attns
 
     o_attn, lse_attn, msk = parallel_attn_nats_fwd(
         q_attn, k_attn, v_attn, nats_block_types, nats_block_indices,
         g_cumsum_attn, scale_attn, NAtS_block_size=nats_block_size,
-        sliding_window_size=attn_sw_size,
         offset_attn=OFFSET_ATTN,
-        compute_incomplete_chunk_scores=incomplete_block_strategy.attn if attn_sw_size is None else False,
+        compute_incomplete_chunk_scores=incomplete_block_strategy.attn,
         is_causal=True, store_msk=False,
     )
 
-    # gated delta net
-    if lattn_use_qk_l2norm_in_kernel:
-        q_lattn, q_rstd_lattn = l2norm_fwd(q_lattn)
-        k_lattn, k_rstd_lattn = l2norm_fwd(k_lattn)
-    else:
-        q_rstd_lattn, k_rstd_lattn = None, None
-
-    chunk_indices_delta_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_GATED_DELTA_NET],
+    chunk_indices_mamba_nats = prepare_nats_block_indices(n_nats_blocks[..., OFFSET_MAMBA],
                                                           nats_block_size,
                                                           CHUNK_SIZE, )
-    nats_block_delta_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
+    nats_block_mamba_offsets = prepare_nats_chunk_offsets(n_nats_blocks,
                                                           nats_block_types,
                                                           nats_block_size,
-                                                          CHUNK_SIZE, OFFSET_GATED_DELTA_NET)
+                                                          CHUNK_SIZE, OFFSET_MAMBA)
 
-    starting_h_idx_gated_delta = compute_starting_idx_for_chunks(
+    starting_h_idx_mamba = compute_starting_idx_for_chunks(
         nats_block_indices=nats_block_indices,
         T=T,
         BT=CHUNK_SIZE,
         NAtS_Block_Size=nats_block_size,
-        offset_op=OFFSET_GATED_DELTA_NET
+        offset_op=OFFSET_MAMBA
     )
 
-    o_gated_delta_net, gdn_final_state, gdn_chunk_start = chunk_gated_delta_rule_nats_inference_fwd(
-        q=q_lattn,
-        k=k_lattn,
-        v=v_lattn,
+    o_mamba, mamba_final_state, mamba_chunk_start = chunk_mamba_inference_fwd(
+        X=v_lattn,
+        B=k_lattn,
+        C=q_lattn,
         g=g,
-        beta=beta,
         nats_block_types=nats_block_types,
         op_type_last_chunk=op_type_last_chunk,
         nats_block_indices=nats_block_indices,
         n_nats_blocks=n_nats_blocks,
         scale=scale_lattn,
-        initial_state=initial_state_gated_delta_chunk_start,
-        output_final_state=output_final_state_gated_delta,
-        chunk_indices_delta_nats=chunk_indices_delta_nats,
-        nats_block_delta_offsets=nats_block_delta_offsets,
-        starting_h_idx_delta=starting_h_idx_gated_delta,
+        initial_state=initial_state_mamba_start,
+        output_final_state=output_final_state_mamba,
+        chunk_indices_mamba_nats=chunk_indices_mamba_nats,
+        nats_block_mamba_offsets=nats_block_mamba_offsets,
+        starting_h_idx_mamba=starting_h_idx_mamba,
         cu_seqlens=cu_seqlens,
         cu_seqlens_nats=cu_seqlens_nats,
         nats_block_size=nats_block_size,
-        offset_delta=OFFSET_GATED_DELTA_NET,
-        compute_incomplete_chunk_scores=incomplete_block_strategy.gated_delta_net,
+        offset_mamba=OFFSET_MAMBA,
+        compute_incomplete_chunk_scores=incomplete_block_strategy.mamba,
         incomplete_block_start_with_ht=incomplete_block_start_with_ht,
-        decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
-        keep_wu_as_kv=keep_wu_as_kv,
+        decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
     )
-    return o_gated_delta_net, o_attn, gdn_final_state, gdn_chunk_start
+    return o_mamba, o_attn, mamba_final_state, mamba_chunk_start
 
 
-def nats_mixed_attn_gdn_recurrent(
+def nats_mixed_attn_mamba_recurrent(
         q_attn: torch.Tensor, k_attn: torch.Tensor, v_attn: torch.Tensor,
         q_lattn: torch.Tensor, k_lattn: torch.Tensor, v_lattn: torch.Tensor,
         attn_msk: torch.Tensor,
-        initial_state_gated_delta: torch.Tensor,
-        initial_state_gated_delta_chunk_start: torch.Tensor,
+        initial_state_mamba: torch.Tensor,
+        initial_state_mamba_chunk_start: torch.Tensor,
         g: torch.Tensor,
         g_cumsum: torch.Tensor,
-        beta: torch.Tensor,
         nats_block_types: torch.Tensor,
         n_tokens_in_current_block:int = 0,
         scale_attn=None, scale_lattn=None,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size: int = 64,
-        attn_sw_size: int | None = None,
-        ops_for_incomplete_chunks: str = 'gated_delta_net',
-        output_final_state_gated_delta: bool = False,
-        decay_for_non_gdn_blocks:bool=False,
+        ops_for_incomplete_chunks: str = 'all',
+        output_final_state_mamba: bool = False,
+        decay_for_non_mamba_blocks:bool=False,
         incomplete_block_start_with_ht: bool = True,
         use_g_for_attn: bool = False, # TODO this is also required!!!
-        lattn_use_qk_l2norm_in_kernel: bool = True,
 ):
     # TODO consider the case where decay still happens with inactivate gdn blocks!
     if scale_attn is None:
@@ -470,7 +484,7 @@ def nats_mixed_attn_gdn_recurrent(
 
     incomplete_block_strategy = all_incomplete_ops[ops_for_incomplete_chunks]
     OFFSET_ATTN = 0
-    OFFSET_GATED_DELTA_NET = 1
+    OFFSET_MAMBA = 1
 
     stream_softmax_attn = torch.cuda.Stream()
     stream_lattn = torch.cuda.Stream()
@@ -480,50 +494,43 @@ def nats_mixed_attn_gdn_recurrent(
             q_attn.transpose(1,2), k_attn.transpose(1,2), v_attn.transpose(1,2), attn_mask=attn_msk, scale=scale_attn
         ).transpose(1,2).contiguous()
 
-    
     with torch.cuda.stream(stream_lattn):
-        if incomplete_block_strategy.gated_delta_net:
+        if incomplete_block_strategy.mamba:
             # in this case, we simply do a one step recurrent fwd
-            o_gated_delta_net, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule(
+            o_mamba, final_state, initial_state_in_current_block = fused_recurrent_mamba_nats_fwd(
                 q_lattn, k_lattn, v_lattn, g=g, g_cumsum=g_cumsum,
-                beta=beta,
                 nats_block_types=nats_block_types,
                 n_tokens_in_current_block=n_tokens_in_current_block,
                 scale=scale_lattn,
-                initial_state=initial_state_gated_delta,
-                initial_state_current=initial_state_gated_delta_chunk_start,
+                initial_state=initial_state_mamba,
+                initial_state_in_current_block=initial_state_mamba_chunk_start,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_nats=cu_seqlens_nats,
                 nats_block_size=nats_block_size,
-                offset_op=OFFSET_GATED_DELTA_NET,
-                decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                offset_op=OFFSET_MAMBA,
+                decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
                 only_update_hidden_states=False,
                 output_final_state=True,
                 update_hs_for_each_iter=True,
-                use_qk_l2norm_in_kernel=lattn_use_qk_l2norm_in_kernel,
             )
         else:
-            # here, since we do not need to update the hidden states at each time step, we only update the recurrent states 
-            # with parallel form. This will be checked within each chunk. So we cannot merge them into one single function.
             n_tokens_first = nats_block_size - n_tokens_in_current_block
             # in this case, we first directly compute Q out
-            o_gated_delta_net = torch.empty(*q_lattn.shape[:2], *v_lattn.shape[2:], device=v_lattn.device, dtype=q_lattn.dtype)
-            o_gated_delta_net[:, :n_tokens_first], final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule(
+            o_mamba = torch.empty(*q_lattn.shape[:2], *v_lattn.shape[2:], device=v_lattn.device, dtype=q_lattn.dtype)
+            o_mamba[:, :n_tokens_first], final_state, initial_state_in_current_block = fused_recurrent_mamba_nats_fwd(
                 q_lattn[:, :n_tokens_first], k_lattn, v_lattn, g=g[:, :n_tokens_first].contiguous() + g_cumsum,
-                beta=beta,
                 nats_block_types=nats_block_types,
                 n_tokens_in_current_block=n_tokens_in_current_block,
                 scale=scale_lattn,
-                initial_state=initial_state_gated_delta,
-                initial_state_current=initial_state_gated_delta_chunk_start,
+                initial_state=initial_state_mamba,
+                initial_state_in_current_block=initial_state_mamba_chunk_start,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_nats=cu_seqlens_nats,
                 nats_block_size=nats_block_size,
-                offset_op=OFFSET_GATED_DELTA_NET,
-                decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                offset_op=OFFSET_MAMBA,
+                decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
                 only_update_hidden_states=False,
                 output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
             )
             # we now use parallel form to update the hidden states
             n_iters = (n_tokens_in_current_block + q_lattn.shape[1] - 1) // nats_block_size
@@ -531,65 +538,59 @@ def nats_mixed_attn_gdn_recurrent(
                 i_start = i * nats_block_size
                 i_end = (i + 1) * nats_block_size
 
-                _, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule(
+                _, final_state, initial_state_in_current_block = fused_recurrent_mamba_nats_fwd(
                     q=None, k=k_lattn[:, i_start:i_end].contiguous(), v=v_lattn[:, i_start:i_end].contiguous(),
-                    g=g[:, :n_tokens_first].sum(1,  keepdim=True) + g_cumsum, beta=beta[:,i_start:i_end].contiguous(),
+                    g=g[:, :n_tokens_first].sum(1,  keepdim=True) + g_cumsum,
                     nats_block_types=nats_block_types[:, [i]].contiguous(),
-                    output_final_state=output_final_state_gated_delta,
+                    output_final_state=output_final_state_mamba,
                     scale=scale_lattn,
-                    initial_state=initial_state_gated_delta,
-                    initial_state_current=initial_state_gated_delta_chunk_start,
+                    initial_state=initial_state_mamba,
+                    initial_state_in_current_block=initial_state_mamba_chunk_start,
                     cu_seqlens=cu_seqlens,
                     cu_seqlens_nats=cu_seqlens_nats,
                     nats_block_size=nats_block_size,
-                    offset_op=OFFSET_GATED_DELTA_NET,
-                    decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                    offset_op=OFFSET_MAMBA,
+                    decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
                     only_update_hidden_states=True,
-                    use_qk_l2norm_in_kernel=True,
                 )
                 i_q_start = (i + 1) * nats_block_size - n_tokens_in_current_block
                 i_q_end = (i + 2) * nats_block_size - n_tokens_in_current_block
-                o_gated_delta_net[:, i_q_start:i_q_end], final_state, initial_state_in_current_block  = fused_recurrent_gated_delta_rule(
+                o_mamba[:, i_q_start:i_q_end], final_state, initial_state_in_current_block  = fused_recurrent_mamba_nats_fwd(
                     q_lattn[:, i_q_start:i_q_end].contiguous(), k_lattn, v_lattn,
                     g=g[:, i_q_start:i_q_end].contiguous(),
-                    beta=beta,
                     nats_block_types=nats_block_types,
                     n_tokens_in_current_block=n_tokens_in_current_block,
                     scale=scale_lattn,
-                    initial_state=initial_state_gated_delta,
-                    initial_state_current=initial_state_gated_delta_chunk_start,
+                    initial_state=initial_state_mamba,
+                    initial_state_in_current_block=initial_state_mamba_chunk_start,
                     cu_seqlens=cu_seqlens,
                     cu_seqlens_nats=cu_seqlens_nats,
                     nats_block_size=nats_block_size,
-                    offset_op=OFFSET_GATED_DELTA_NET,
-                    decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                    offset_op=OFFSET_MAMBA,
+                    decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
                     only_update_hidden_states=False,
                     output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
                 )
             if (n_tokens_in_current_block + q_lattn.shape[1]) % nats_block_size == 0:
                 i_start = n_tokens_in_current_block + q_lattn.shape[1] - nats_block_size
                 # we need to update the final state for the last time:
-                _, final_state, initial_state_in_current_block = fused_recurrent_gated_delta_rule(
+                _, final_state, initial_state_in_current_block = fused_recurrent_mamba_nats_fwd(
                     q=None, k=k_lattn[:, i_start:].contiguous(), v=v_lattn[:, i_start:].contiguous(),
-                    g=g[:, i_start:].contiguous(), beta=beta[:, i_start:].contiguous(),
+                    g=g[:, i_start:].contiguous(), 
                     nats_block_types=nats_block_types[:, [-1]].contiguous(),
-                    output_final_state=output_final_state_gated_delta,
+                    output_final_state=output_final_state_mamba,
                     scale=scale_lattn,
-                    initial_state=initial_state_gated_delta,
-                    initial_state_current=initial_state_gated_delta_chunk_start,
+                    initial_state=initial_state_mamba,
+                    initial_state_in_current_block=initial_state_mamba_chunk_start,
                     cu_seqlens=cu_seqlens,
                     cu_seqlens_nats=cu_seqlens_nats,
                     nats_block_size=nats_block_size,
-                    offset_op=OFFSET_GATED_DELTA_NET,
-                    decay_for_non_gdn_blocks=decay_for_non_gdn_blocks,
+                    offset_op=OFFSET_MAMBA,
+                    decay_for_non_mamba_blocks=decay_for_non_mamba_blocks,
                     only_update_hidden_states=True,
-                    use_qk_l2norm_in_kernel=True,
                 )
 
-    return o_gated_delta_net, o_attn, final_state, initial_state_in_current_block
-
-
+    return o_mamba, o_attn, final_state, initial_state_in_current_block
 
 
 def test_mixed_attn():
@@ -619,16 +620,20 @@ def test_mixed_attn():
     q = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, T, HDELTA * DGATED), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, T, HDELTA * DGATED * V_EXPAND), dtype=dtype, device=device, requires_grad=True)
-    logits = torch.randn(BATCH, TNAtS, HNATS * N_OPTs, device=device, dtype=dtype)
 
-    beta = torch.randn(BATCH, T, HDELTA, dtype=dtype, device=device, requires_grad=True).sigmoid()
-    g0 = F.logsigmoid(torch.rand(BATCH, T, HDELTA, dtype=torch.float32, device=device, requires_grad=True) * 20)
+    logits = torch.randn(BATCH, TNAtS, HNATS * N_OPTs, device=device, dtype=dtype)
+    A = torch.empty(HNATS, dtype=torch.float32, device=torch.device('cuda')).uniform_(0, 16)
+    A = torch.log(A)
+    A = -torch.exp(A.float()) / 100
+    dt = torch.randn(BATCH, T, HNATS, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HNATS, device=device, dtype=dtype)
 
     q = torch.nn.Parameter(q, requires_grad=True)
     k = torch.nn.Parameter(k, requires_grad=True)
     v = torch.nn.Parameter(v, requires_grad=True)
-    beta = torch.nn.Parameter(beta, requires_grad=True)
-    g0 = torch.nn.Parameter(g0, requires_grad=True)
+    A = torch.nn.Parameter(A, requires_grad=True)
+    dt = torch.nn.Parameter(dt, requires_grad=True)
+    dt_bias = torch.nn.Parameter(dt_bias, requires_grad=True)
     logits = torch.nn.Parameter(logits, requires_grad=True)
 
     q_attn = q.view(BATCH, T, HATTN, DATTN)
@@ -644,20 +649,21 @@ def test_mixed_attn():
     nats_block_types[:,-1] = 1
     n_nats_blocks = nats_block_types.int().sum(1)
 
-    o_gated_delta_net,  o_attn, gated_delta_ht = nats_mixed_attn_gdn(
+    o_mamba,  o_attn, mamba_h = nats_mixed_attn_mamba(
         q_attn=q_attn, k_attn=k_attn, v_attn=v_attn,
         q_lattn=q_lattn, k_lattn=k_lattn, v_lattn=v_lattn,
-        initial_state_gated_delta=None,
-        g=g0, beta=beta, nats_block_types=nats_block_types, n_nats_blocks=n_nats_blocks,
-        scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=k_lattn.shape[-1] ** -0.5,
+        initial_state_mamba=None,
+        A=A, dt=dt, dt_bias=dt_bias,
+        nats_block_types=nats_block_types, n_nats_blocks=n_nats_blocks,
+        scale_attn=k_attn.shape[-1] ** -0.5, scale_lattn=1,
         cu_seqlens=None, cu_seqlens_nats=None,
         nats_block_size=NATS_block_size,
-        ops_for_incomplete_chunks='attn',
+        ops_for_incomplete_chunks='all',
         compute_dnats_for_invalid_blocks_attn=False,
         compute_dnats_for_invalid_blocks_linear_att=True
     )
 
-    loss = (o_gated_delta_net ** 2) + o_attn.view(o_gated_delta_net.shape) ** 2
+    loss = (o_mamba ** 2) + o_attn.view(o_mamba.shape) ** 2
     loss.sum().backward()
     import pdb
     pdb.set_trace()

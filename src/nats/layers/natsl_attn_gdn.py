@@ -13,8 +13,8 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch.nn import functional as F
 
-from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
-from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution, RotaryEmbedding
+from fla.layers.utils import  pad_input
+from fla.modules import RMSNorm, ShortConvolution, RotaryEmbedding
 from fla.ops.utils.index import prepare_lens_from_mask
 from fla.ops.utils.pooling import mean_pooling
 
@@ -63,7 +63,11 @@ def hard_softmax(
 
 class NeuralAttentionSearchLinearAttnGDN(nn.Module):
     """
-    The Architecture of this layer is implemented based on the GatedDeltaNet architecture
+    The Architecture of this layer is implemented based on the GatedDeltaNet architecture. 
+    Here, the linear attention and softmax attention layers will share the same set of parameters. Hence, most parameters
+    are the same as the GDN layer. However, we also makes following changes:
+    1. we add a linear layer to compute the score of each operation for each chunk
+    2. we add a linear layer to compute the weights of each operations if `outputs_are_weighted` is set True
 
     Parameter alloation when use_gate=True:
         - 0.75 * hidden_size * hidden_size for the q_proj and k_proj each
@@ -86,10 +90,29 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         head_dim (int, Optional):
             The dimension of each head. Default: 256.
         num_heads (int, Optional):
-            The number of heads. Default: 4.
+            The number of linear attention heads. Default: 6.
+        num_attn_heads (int, Optional):
+            The number of softmax attention heads. This should be the multiple of num_heads, Default: 4.
         num_v_heads (int, Optional):
             The number of heads for the value projection, equal to `num_heads` if `None`.
             GVA is applied if `num_v_heads` > `num_heads`. Default: `None`.
+        n_ops (int):
+            Number of operations in the search space. By default, we have gated delta net and linear attention 
+            and softmax attention. Default: 2. 
+        num_nats_head (int, Optional):
+            Number of NAtS heads. This value should be divisible by the smallest value between num_heads and num_attn_heads.
+        nats_block_size (int):
+            NAtS chunk size, set default to 64. The same as the chunk size of officical GDN implementation. For the sake of efficiency, this
+            value should not be smaller than the GDN chunk size. Default: 64.
+        nats_block_agg_type (str),
+            The sequence wise pooling layer applied before the nats_layer to aggregrate the sequence wise feature maps. Currently, we only support 
+            average pooling ('mean').
+        nats_sample_strategy (str),
+            How to sample an operation given the logits computed by nats_layer. Currently, we support gumble_soft_max and argmax (similar to 
+            gumble softmax, but without the random variables).
+        ops_for_incomplete_chunks (str),
+            operations applied for incomplete chunks. Currently, we support 'gated_delta_net' (linear attention only), 'attn' (softmax attention only),
+            and 'all' (both linear attention and softmax attention)
         mode (str, Optional):
             Which Gated DeltaNet kernel to use.
             Currently available: `chunk` and `fused_recurrent`.
@@ -107,6 +130,28 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
         conv_bias (bool, Optional):
             Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
+        outputs_are_weighted (bool):
+            if the two outputs are weighted, if yes, a learnable weights derived from q matrix is attached to the normalized outputs from both attention outputs. 
+        attn_qk_norm (bool):
+            if QK norm is applied for softmax attention layers. Default: True
+        attn_with_short_conv (bool)
+            if attn matrixed are also mapped from a short conv layer. Default: True
+        compute_dnats_for_invalid_blocks_attn (bool):
+            If we want to compute the gradients for the softmax attnetions for liner attention chunks. This provides a more accurate gradient estimation but also 
+            requries much more computational power. Default: False
+        compute_dnats_for_invalid_blocks_linear_att (bool):
+            If we want to compute the gradients for the linear attnetions for softmax attention chunks. This provides a more accurate gradient estimation but also 
+            requries much more computational power. Default: False
+        decay_for_non_gdn_blocks (bool):
+            If decay is applied for even non-gdn blocks. This helps the linear attention states to focus more on hte most recent information. Defautl: True.
+        incomplete_block_start_with_ht (bool):
+            if the incomplete block start from the most recent linear attention state or from the initial hidden state. Default: True.
+        attn_apply_pos_encoding (bool):
+            if positinoal encoding is applied to softmax attention layers. Default: False
+        attn_rope_theta (float, Optional):
+            attention rope theta values. Default: 10000.
+        attn_max_position_embeddings (int, Optional)
+            the maximal positional embedding applied to softmax attention layers, if it is None, no limit is applied. Default: None.
         layer_idx (int, Optional):
             The index of the layer. Default: None.
         norm_eps (float, Optional):
@@ -126,17 +171,17 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             nats_block_size: int = 64,
             nats_block_agg_type: str = 'mean',
             nats_sample_strategy: str = 'argmax',
-            ops_for_incomplete_chunks: str = 'gated_delta_net',
+            ops_for_incomplete_chunks: str = 'all',
             mode: str = 'chunk',
             use_gate: bool = True,
             use_short_conv: bool = True,
             allow_neg_eigval: bool = False,
             conv_size: int = 4,
             conv_bias: bool = False,
-            conv_activation: str | None = 'silu',  # TODO check if None or silu works better?
-            outputs_are_wighted:bool = True,
-            attn_qk_norm: bool = False,
-            attn_with_short_conv: bool = False,
+            conv_activation: str | None = 'silu', 
+            outputs_are_weighted:bool = True,
+            attn_qk_norm: bool = True,
+            attn_with_short_conv: bool = True,
             compute_dnats_for_invalid_blocks_attn: bool= False,
             compute_dnats_for_invalid_blocks_linear_att: bool = False,
             decay_for_non_gdn_blocks: bool = True,
@@ -201,7 +246,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         else:
             self.rotary = None
 
-        self.usg_for_attn = False  # TODO this can also be true, but we need to adjust the g for attns!
+        self.usg_for_attn = False  # TODO this can also be true, but we need to implement g for attns!
 
         # for nats
         if num_nats_head is None:
@@ -235,7 +280,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         if not math.isclose(head_dim * expand_v, self.head_v_dim, rel_tol=1e-5):
             raise ValueError(
                 f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
-                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated."
+                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedMultiInputRMSNormGated."
             )
         assert mode in ['chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
 
@@ -276,8 +321,9 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
         # name.endswith("bias") in param_grouping.py
         self.dt_bias._no_weight_decay = True
 
-        self.outputs_are_wighted = outputs_are_wighted
-        if self.outputs_are_wighted:
+        self.outputs_are_weighted = outputs_are_weighted
+        if self.outputs_are_weighted:
+            # the weights for each operation is derived from the q matrix. Therefore, the input dimension is self.key_dim
             self.nats_out_weights_layer = nn.Linear(self.key_dim, self.n_ops * self.num_attn_heads, bias=False)
 
         if use_short_conv:
@@ -309,7 +355,10 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
             self.o_norm = FusedMultiInputRMSNormGated(self.head_attn_v_dim , eps=norm_eps)
         else:
-            self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps)
+            self.o_norm = nn.ModuleList([
+                RMSNorm(self.head_v_dim, eps=norm_eps), 
+                RMSNorm(self.head_attn_v_dim, eps=norm_eps)]
+                )
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
         self.attn_fraction = torch.zeros(1)
 
@@ -332,7 +381,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
             if len(attention_mask) > 1:
-                 raise NotImplementedError("Attention with ")
+                 raise NotImplementedError("Attention with variable length is not supported yet!")
         batch_size, q_len, dim = hidden_states.shape
         # change to inference mode.
         mode = 'fused_recurrent' if q_len < 64 else self.mode
@@ -340,6 +389,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
         nats_cache: NAtSLayerCache | None = None
+        # Here we need to interact with nats_cache multiple times. Therefore, it is better to extract nats_cache for the current layer
         if past_key_values is not None:
             if len(past_key_values) > self.layer_idx:
                 nats_cache = past_key_values[self.layer_idx]
@@ -368,7 +418,6 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
             nats_op_types = self.nats_layer(hs_reduced)
             nats_op_logits = rearrange(nats_op_types,  '... (h d) -> ... h d', d=self.n_ops)
             nats_op_types = self.nats_sample_func(nats_op_logits)
-            # The last block is set 1 for all the operations. This does not influence the output values
         else:
             nats_op_types = torch.ones(batch_size, 1, self.num_nats_head, self.n_ops,
                                        device=hidden_states.device,dtype=hidden_states.dtype)
@@ -440,7 +489,7 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
                 q = F.silu(q_attn)
                 k = F.silu(k_attn)
                 v = F.silu(v_attn)
-        if self.outputs_are_wighted:
+        if self.outputs_are_weighted:
             o_weights = self.nats_out_weights_layer(q).unflatten(-1, (self.num_attn_heads, self.n_ops)).softmax(-1)
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
@@ -596,17 +645,17 @@ class NeuralAttentionSearchLinearAttnGDN(nn.Module):
 
         if self.use_gate:
             g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
-            if self.outputs_are_wighted:
+            if self.outputs_are_weighted:
                 o = self.o_norm(o_gated_delta.view(o_attn.shape), o_attn, g, o_weights)
             else:
                 o = self.o_norm(o_gated_delta, o_attn.view(o_gated_delta.shape),g)
         else:
-            raise NotImplementedError
+            o1 = self.o_norm[0](o_gated_delta)
+            o2 = self.o_norm[1](o_attn)
+            o = o1 + o2.view(o1.shape)
             #o = self.o_norm(o)
         o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
-        #if attention_mask is not None:
-        #    o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
 
@@ -624,22 +673,24 @@ def test_mixed_attn():
                                         expand_v=2,
                                         ops_for_incomplete_chunks=ops_for_incomplete_chunks,
                                         use_short_conv=False,
-                                        outputs_are_wighted=True,
+                                        outputs_are_weighted=True,
                                        attn_qk_norm=True,
                                        attn_with_short_conv=True,
                                        layer_idx=0,
-                                               decay_for_non_gdn_blocks=True,
+                                               decay_for_non_gdn_blocks=False,
                                         ).cuda().to(dtype=dtype)
-    layer = layer.eval()
+    #layer = layer.eval()
     #nt = 118
-    nt = 432
+    nt = 1036
     input_data = torch.randn((2, nt, 1024)).cuda().to(dtype=dtype)
     out1 = layer(input_data)[0]
+    loss = (out1**2).sum()
+    loss.backward()
 
     cache = [NAtSLayerCache(op_for_incomplete_chunk=ops_for_incomplete_chunks)]
     out2 = torch.empty_like(out1).to(dtype=dtype)
     #nt2 = 256
-    nt2=65
+    nt2=76
     nt1 = nt-nt2
 
     out21, _, cache = layer(input_data[:, :nt1], past_key_values=cache, use_cache=True)
@@ -653,9 +704,6 @@ def test_mixed_attn():
         out2[:, [nt1+i]] = o_current
 
     diff = out2 - out1
-
-    import pdb
-    pdb.set_trace()
 
 
     BATCH = 2
@@ -721,8 +769,6 @@ def test_mixed_attn():
 
     loss = (out ** 2)
     loss.sum().backward()
-    import pdb
-    pdb.set_trace()
 
 
 if __name__ == "__main__":

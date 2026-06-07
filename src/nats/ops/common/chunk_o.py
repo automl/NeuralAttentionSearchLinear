@@ -1416,8 +1416,6 @@ def chunk_bwd_dv_qdo_nats_local(
         # computational chunk, we store them to the next h. Hence, for any chunk_indices, if its next block indices
         # is TNAtS, we only do one iteration and stll compute the remaining parts. Hence, we will add the remaining index
         # here
-        require_additional_block = nats_block_types[:, -1, :, offset_op].flatten() == 0.0
-
         qdo = torch.zeros(len(chunk_indices_op_nats), GNAtS, K, V, device=do.device, dtype=do.dtype)
         BK = 64
         BV = 64
@@ -1506,7 +1504,7 @@ def chunk_bwd_nats_dqkwg(
 
     CONST_TILING = 64 if check_shared_mem() else 32
     BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(K), CONST_TILING)
+    BV = min(triton.next_power_of_2(V), CONST_TILING)
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(q)
     dk = torch.zeros_like(k)

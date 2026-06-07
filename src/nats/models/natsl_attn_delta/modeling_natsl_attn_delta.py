@@ -87,7 +87,7 @@ class NeuralAttentionSearchLinearAttnDeltaBlock(nn.Module):
                 allow_neg_eigval=config.allow_neg_eigval,
                 conv_size=config.conv_size,
                 conv_bias=config.conv_bias,
-                outputs_are_wighted=config.outputs_are_wighted,
+                outputs_are_weighted=config.outputs_are_weighted,
                 attn_qk_norm=config.attn_qk_norm,
                 attn_with_short_conv=config.attn_with_short_conv,
                 compute_dnats_for_invalid_blocks_attn=config.compute_dnats_for_invalid_blocks_attn,

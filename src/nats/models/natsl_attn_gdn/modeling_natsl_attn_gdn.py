@@ -168,7 +168,6 @@ class NeuralAttentionSearchLinearAttnGDNPreTrainedModel(PreTrainedModel):
     ):
         if (isinstance(module, NeuralAttentionSearchLinearAttnGDN) and next(module.parameters()).device.type != 'meta') \
                 or (isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta'):
-            # TODO check the case if we init them to 0!
             with torch.no_grad():
                 module.A_log.copy_(nn.init.uniform_(module.A_log, a=0, b=16).log())
                 module.A_log._no_weight_decay = True
